@@ -135,6 +135,8 @@ const (
 	AzureScheme = "azure"
 	// CloudStorageNoopScheme indicates the scheme is noop.
 	CloudStorageNoopScheme = "noop"
+	// IcebergScheme indicates the scheme is Apache Iceberg.
+	IcebergScheme = "iceberg"
 	// PulsarScheme  indicates the scheme is pulsar
 	PulsarScheme = "pulsar"
 	// PulsarSSLScheme indicates the scheme is pulsar+ssl

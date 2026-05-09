@@ -1,0 +1,147 @@
+name: ticdc-iceberg-e2e
+
+services:
+  pd:
+    image: pingcap/pd:v8.5.6
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+    ports:
+      - "2379:2379"
+    volumes:
+      - pd-data:/data/pd
+
+  tikv:
+    image: pingcap/tikv:v8.5.6
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --data-dir=/data/tikv
+      - --pd=pd:2379
+    depends_on:
+      - pd
+    ports:
+      - "20160:20160"
+    volumes:
+      - tikv-data:/data/tikv
+
+  tidb:
+    image: pingcap/tidb:v8.5.6
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --host=0.0.0.0
+      - --advertise-address=tidb
+      - --status=10080
+    depends_on:
+      - pd
+      - tikv
+    ports:
+      - "4000:4000"
+      - "10080:10080"
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    environment:
+      CATALOG_WAREHOUSE: file:///tmp/iceberg-warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.hadoop.HadoopFileIO
+    ports:
+      - "8181:8181"
+    volumes:
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+  presto:
+    image: prestodb/presto:0.297
+    depends_on:
+      - iceberg-rest
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./presto/etc/catalog/iceberg.properties:/opt/presto-server/etc/catalog/iceberg.properties:ro
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+  spark:
+    image: tabulario/spark-iceberg:latest
+    depends_on:
+      - iceberg-rest
+    ports:
+      - "4040:4040"
+      - "8888:8888"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+  ticdc-1:
+    image: local/ticdc-iceberg:e2e
+    command:
+      - server
+      - --newarch
+      - --pd=http://pd:2379
+      - --addr=0.0.0.0:8300
+      - --advertise-addr=ticdc-1:8300
+      - --data-dir=/data/ticdc
+      - --log-level=info
+    depends_on:
+      - pd
+      - tikv
+      - tidb
+      - iceberg-rest
+    ports:
+      - "8300:8300"
+    volumes:
+      - ticdc-1-data:/data/ticdc
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+  ticdc-2:
+    image: local/ticdc-iceberg:e2e
+    command:
+      - server
+      - --newarch
+      - --pd=http://pd:2379
+      - --addr=0.0.0.0:8300
+      - --advertise-addr=ticdc-2:8300
+      - --data-dir=/data/ticdc
+      - --log-level=info
+    depends_on:
+      - pd
+      - tikv
+      - tidb
+      - iceberg-rest
+    ports:
+      - "8301:8300"
+    volumes:
+      - ticdc-2-data:/data/ticdc
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+  ticdc-3:
+    image: local/ticdc-iceberg:e2e
+    command:
+      - server
+      - --newarch
+      - --pd=http://pd:2379
+      - --addr=0.0.0.0:8300
+      - --advertise-addr=ticdc-3:8300
+      - --data-dir=/data/ticdc
+      - --log-level=info
+    depends_on:
+      - pd
+      - tikv
+      - tidb
+      - iceberg-rest
+    ports:
+      - "8302:8300"
+    volumes:
+      - ticdc-3-data:/data/ticdc
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+volumes:
+  pd-data:
+  tikv-data:
+  ticdc-1-data:
+  ticdc-2-data:
+  ticdc-3-data:

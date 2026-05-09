@@ -1,0 +1,151 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package iceberg
+
+import (
+	"fmt"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	defaultCommitInterval = 60 * time.Second
+	defaultBatchRows      = 1024
+	defaultTableSuffix    = "_cdc"
+	defaultStagingDir     = "/tmp/ticdc-iceberg-staging"
+)
+
+// Config contains the local-first Iceberg sink settings parsed from sink-uri.
+type Config struct {
+	CatalogURI     string
+	Warehouse      string
+	StagingDir     string
+	DatabasePrefix string
+	TableSuffix    string
+	CommitInterval time.Duration
+	BatchRows      int
+}
+
+// ParseConfig parses the iceberg:// sink URI. By default
+// iceberg://host:port maps to an HTTP REST catalog at http://host:port/.
+func ParseConfig(uri *url.URL) (*Config, error) {
+	if uri == nil {
+		return nil, fmt.Errorf("nil iceberg sink URI")
+	}
+	if strings.ToLower(uri.Scheme) != "iceberg" {
+		return nil, fmt.Errorf("invalid iceberg sink scheme %q", uri.Scheme)
+	}
+
+	query := uri.Query()
+	cfg := &Config{
+		CatalogURI:     query.Get("catalog-uri"),
+		Warehouse:      query.Get("warehouse"),
+		StagingDir:     firstNonEmpty(query.Get("staging-dir"), query.Get("iceberg-staging-dir")),
+		DatabasePrefix: firstNonEmpty(query.Get("database-prefix"), query.Get("iceberg-database-prefix")),
+		TableSuffix:    firstNonEmpty(query.Get("table-suffix"), query.Get("iceberg-table-suffix"), defaultTableSuffix),
+		CommitInterval: defaultCommitInterval,
+		BatchRows:      defaultBatchRows,
+	}
+
+	if cfg.CatalogURI == "" {
+		if uri.Host == "" {
+			return nil, fmt.Errorf("iceberg sink URI must include a catalog host or catalog-uri parameter")
+		}
+		cfg.CatalogURI = (&url.URL{Scheme: "http", Host: uri.Host, Path: "/"}).String()
+	}
+	if cfg.Warehouse == "" {
+		return nil, fmt.Errorf("iceberg sink URI must include warehouse parameter")
+	}
+	if cfg.StagingDir != "" {
+		stagingDir, err := localPathFromURI(cfg.StagingDir)
+		if err != nil {
+			return nil, fmt.Errorf("invalid staging-dir %q: %w", cfg.StagingDir, err)
+		}
+		cfg.StagingDir = stagingDir
+	} else {
+		cfg.StagingDir = defaultStagingPath(cfg.Warehouse)
+	}
+
+	if raw := query.Get("commit-interval"); raw != "" {
+		duration, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid commit-interval %q: %w", raw, err)
+		}
+		if duration <= 0 {
+			return nil, fmt.Errorf("commit-interval must be positive")
+		}
+		cfg.CommitInterval = duration
+	}
+
+	if raw := query.Get("batch-rows"); raw != "" {
+		rows, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid batch-rows %q: %w", raw, err)
+		}
+		if rows <= 0 {
+			return nil, fmt.Errorf("batch-rows must be positive")
+		}
+		cfg.BatchRows = rows
+	}
+
+	return cfg, nil
+}
+
+// TargetIdentifier maps a TiDB source table to its Iceberg table identifier.
+func (c Config) TargetIdentifier(schemaName, tableName string) []string {
+	return []string{c.DatabasePrefix + schemaName, tableName + c.TableSuffix}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func defaultStagingPath(warehouse string) string {
+	warehousePath, err := localPathFromURI(warehouse)
+	if err == nil && warehousePath != "" {
+		return filepath.Join(warehousePath, ".ticdc-staging")
+	}
+	return defaultStagingDir
+}
+
+func localPathFromURI(raw string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" {
+		if raw == "" {
+			return "", fmt.Errorf("path is empty")
+		}
+		return filepath.Clean(raw), nil
+	}
+	if parsed.Scheme != "file" {
+		return "", fmt.Errorf("must be a local path or file URI")
+	}
+	if parsed.Host != "" && parsed.Host != "localhost" {
+		return "", fmt.Errorf("file URI host %q is not supported", parsed.Host)
+	}
+	if parsed.Path == "" {
+		return "", fmt.Errorf("file URI path is empty")
+	}
+	return filepath.Clean(filepath.FromSlash(parsed.Path)), nil
+}
