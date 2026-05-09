@@ -34,6 +34,9 @@ The Iceberg sink implementation lives under:
 It is registered through the normal sink factory with the `iceberg://` URI
 scheme.
 
+The original implementation design doc from PR #1 is included at
+`docs/design/2026-05-07-ticdc-iceberg-sink-design-generic.md`.
+
 ## Local Stack
 
 The local stack intentionally uses:
@@ -182,7 +185,7 @@ timing luck.
 ## Current Limitations Found
 
 The matrix is intentionally not all green. The non-green rows are documented in
-`ICEBERG_RESILIENCE_RESULTS.md`.
+`ICEBERG_RESILIENCE_RESULTS.md` and summarized in `TEST_FAILURES.md`.
 
 Main correctness gaps:
 
