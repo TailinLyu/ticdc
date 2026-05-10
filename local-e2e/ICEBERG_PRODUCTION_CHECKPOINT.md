@@ -34,18 +34,23 @@ matrix.
 - The committer deduplicates replay through Iceberg snapshot summaries, a
   durable committed-batch ledger under
   `<staging-dir>/<base64(changefeed)>/.committed/<base64(target)>/*.commit`,
-  and a durable row-ID segment ledger under `.committed-rows` with sharded
-  exact row-hash indexes under `.committed-row-index`. Batch markers, row-ID
-  segments, and row indexes are written and synced before staged files are
+  and a durable row-ID segment ledger under `.committed-rows` with Bolt-backed
+  exact row-hash shard indexes under `.committed-row-index`. Batch markers,
+  row-ID segments, and row-index writes are synced before staged files are
   deleted, and snapshot summary hits backfill missing local markers.
 - The replay hot path does not scan retained marker trees into memory. It looks
   up only the candidate staged batch IDs and row IDs currently being drained;
   Iceberg snapshot summaries are scanned from newest to oldest until those batch
   candidates are found. Batch-ledger lookup is direct by candidate marker path,
-  and row-ledger lookup reads only the row-index shards touched by current
+  and row-ledger lookup reads only the Bolt row-index shards touched by current
   candidate row IDs, so all-new replay misses do not decode retained row
-  segments. If a retained segment-only ledger from an older build is present,
-  the first lookup reconciles it into the sharded row index before answering.
+  segments. If a touched shard index is missing or marked dirty after a crash,
+  it is rebuilt from retained segment evidence for that shard before answering;
+  dirty markers are cleared only after the dirty shard set has been repaired.
+  New row-index writes add only the new row hashes to touched shard DBs; they do
+  not rewrite cumulative JSON shard files or untouched retained-history shards.
+  If a retained segment-only ledger from an older build is present, the first
+  lookup reconciles it into the sharded row index before answering.
   The batch and row ledger entry gauges are updated
   incrementally for entries written by the running TiCDC process instead of
   walking the ledger trees on every metrics refresh.
@@ -87,15 +92,15 @@ matrix.
   - Focused durable-ledger/metrics regression tests cover snapshot-history
     expiration dedupe, delayed partial-overlap replay after cleanup,
     5k-row row-ledger segment/index cardinality, retained-history row miss
-    lookup, segment-only ledger index reconciliation, ledger-before-delete
-    ordering, staged byte/backend metrics, committed row metrics, and
-    batch/row ledger write/lookup metrics.
+    lookup, missing-shard/dirty-shard index reconciliation, untouched retained
+    shard index non-rewrite, ledger-before-delete ordering, staged byte/backend
+    metrics, committed row metrics, and batch/row ledger write/lookup metrics.
   - Focused review regressions cover staged-file fsync plus parent-directory
     fsync before return, candidate-bounded snapshot-summary dedupe, and
     restart-safe partial-overlap replay dedupe.
 - Replay/crash reruns:
-  - `S03_REPLAY_PASS cf=s03-replay-1778404206 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
-  - `S05_REPLAY_PASS cf=s05-replay-1778404161 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S03_REPLAY_PASS cf=s03-replay-1778406697 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S05_REPLAY_PASS cf=s05-replay-1778406656 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
   - `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0`
 - Earlier metrics scrape after S05 showed `ticdc_sink_iceberg_commit_duration_seconds`,

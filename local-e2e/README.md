@@ -213,16 +213,19 @@ Remaining intentional limitations:
   write, file fsync, close, atomic rename, and parent directory fsync.
 - Replay dedupe now uses Iceberg snapshot summaries, a durable committed-batch
   ledger under `.committed`, a durable committed row-ID segment ledger under
-  `.committed-rows`, and sharded exact row-hash indexes under
+  `.committed-rows`, and Bolt-backed exact row-hash shard indexes under
   `.committed-row-index` in the shared staging directory. Operators must retain
   staged files and committed ledger/index markers for at least the maximum
   replay horizon. Batch-ledger lookup is direct by current candidate marker
-  path, and row-ledger lookup reads only the row-index shards touched by current
-  candidate row IDs, so all-new replay misses do not decode retained row
-  segments. A retained segment-only ledger from an older build is reconciled
-  into the sharded row index on first lookup. Iceberg snapshot-summary dedupe
-  scans newest-first and stops once the current staged batch candidates are
-  found. Partial-overlap replay is
+  path, and row-ledger lookup reads only the Bolt row-index shards touched by
+  current candidate row IDs, so all-new replay misses do not decode retained row
+  segments. Missing or dirty shard indexes are rebuilt from retained segment
+  evidence before lookup returns; dirty markers are cleared only after the dirty
+  shard set has been repaired. New commits add only new row hashes to touched
+  shard DBs instead of rewriting cumulative JSON indexes. A retained
+  segment-only ledger from an older build is reconciled into the sharded row
+  index on first lookup. Iceberg snapshot-summary dedupe scans newest-first and
+  stops once the current staged batch candidates are found. Partial-overlap replay is
   restart-safe even when the overlapping replay batch is staged after the
   earlier stage file has already been cleaned up; duplicate-only replay batches
   are marked handled before cleanup, and the bounded row-ID cache is only an

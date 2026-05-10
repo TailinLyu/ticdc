@@ -76,6 +76,7 @@ require (
 	github.com/uber-go/atomic v1.4.0
 	github.com/xdg/scram v1.0.5
 	github.com/zeebo/assert v1.3.0
+	go.etcd.io/bbolt v1.3.10
 	go.etcd.io/etcd/api/v3 v3.5.15
 	go.etcd.io/etcd/client/pkg/v3 v3.5.15
 	go.etcd.io/etcd/client/v3 v3.5.15
@@ -368,7 +369,6 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
-	go.etcd.io/bbolt v1.3.10 // indirect
 	go.etcd.io/etcd/client/v2 v2.305.15 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

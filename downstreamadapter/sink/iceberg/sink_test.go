@@ -37,6 +37,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 )
 
 type appendCall struct {
@@ -1124,8 +1125,63 @@ func TestStageCommittedRowIDsRebuildsMissingIndexFromRetainedSegments(t *testing
 	require.Contains(t, ledger, "row-a")
 	require.NotContains(t, ledger, "missing")
 
-	_, err = os.Stat(committedRowIndexPath(cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard("row-a")))
+	_, err = os.Stat(committedRowIndexPath(cfg.StagingDir, changefeedID.String(), identifier))
 	require.NoError(t, err)
+}
+
+func TestStageCommittedRowIDsRebuildsMissingShardIndexFromRetainedSegments(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	rowA := "row-a"
+	rowB := rowIDOutsideIndexShard("row-b", committedRowIndexShard(rowA))
+
+	created, err := stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, []string{rowA, rowB}, []string{"batch-a"}, 10)
+	require.NoError(t, err)
+	require.Equal(t, 2, created)
+	deleteRowIndexShardForTest(t, cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard(rowA))
+	requireRowIndexShardExists(t, cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard(rowB))
+
+	ledger, err := stage.CommittedRowIDsForCandidates(ctx, changefeedID.String(), identifier, []string{rowA, rowB, "missing"})
+	require.NoError(t, err)
+	require.Contains(t, ledger, rowA)
+	require.Contains(t, ledger, rowB)
+	require.NotContains(t, ledger, "missing")
+
+	requireRowIndexShardExists(t, cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard(rowA))
+}
+
+func TestStageCommittedRowIDsRepairsDirtyShardIndexesAndClearsMarker(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	rowA := "row-a"
+	rowB := rowIDOutsideIndexShard("row-b", committedRowIndexShard(rowA))
+
+	created, err := stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, []string{rowA, rowB}, []string{"batch-a"}, 10)
+	require.NoError(t, err)
+	require.Equal(t, 2, created)
+	deleteRowIndexShardForTest(t, cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard(rowA))
+	err = stage.markCommittedRowIndexDirty(changefeedID.String(), identifier, map[string]map[string]struct{}{
+		committedRowIndexShard(rowA): {committedRowHash(rowA): {}},
+		committedRowIndexShard(rowB): {committedRowHash(rowB): {}},
+	}, time.Now().UTC())
+	require.NoError(t, err)
+
+	ledger, err := stage.CommittedRowIDsForCandidates(ctx, changefeedID.String(), identifier, []string{rowA, rowB})
+	require.NoError(t, err)
+	require.Contains(t, ledger, rowA)
+	require.Contains(t, ledger, rowB)
+	requireRowIndexShardExists(t, cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard(rowA))
+	requireRowIndexShardExists(t, cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard(rowB))
+	_, err = os.Stat(committedRowIndexDirtyPath(cfg.StagingDir, changefeedID.String(), identifier))
+	require.True(t, os.IsNotExist(err))
 }
 
 func TestStageCommittedRowIDsBatchesFiveThousandRowsIntoSegments(t *testing.T) {
@@ -1151,6 +1207,32 @@ func TestStageCommittedRowIDsBatchesFiveThousandRowsIntoSegments(t *testing.T) {
 	require.Contains(t, ledger, "row-0000")
 	require.Contains(t, ledger, "row-4999")
 	require.NotContains(t, ledger, "missing")
+}
+
+func TestStageCommittedRowIDsDoesNotRewriteUntouchedRetainedShardIndex(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	retainedShard := committedRowIndexShard("retained-row")
+	retainedRows := make([]string, 0, 200)
+	for i := 0; i < cap(retainedRows); i++ {
+		retainedRows = append(retainedRows, rowIDInIndexShard(fmt.Sprintf("retained-row-%04d", i), retainedShard))
+	}
+
+	created, err := stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, retainedRows, []string{"batch-retained"}, 10)
+	require.NoError(t, err)
+	require.Equal(t, len(retainedRows), created)
+	before := rowIndexShardHashes(t, cfg.StagingDir, changefeedID.String(), identifier, retainedShard)
+
+	newRow := rowIDOutsideIndexShard("all-new-row", retainedShard)
+	created, err = stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, []string{newRow}, []string{"batch-new"}, 20)
+	require.NoError(t, err)
+	require.Equal(t, 1, created)
+	after := rowIndexShardHashes(t, cfg.StagingDir, changefeedID.String(), identifier, retainedShard)
+	require.Equal(t, before, after)
 }
 
 func TestCommitterRetriesAppendFailureWithoutStopping(t *testing.T) {
@@ -1761,10 +1843,61 @@ func rowIndexFileCount(t *testing.T, root string) int {
 	return count
 }
 
+func deleteRowIndexShardForTest(t *testing.T, root string, changefeed string, identifier []string, shard string) {
+	t.Helper()
+	db, err := openCommittedRowIndexDB(committedRowIndexPath(root, changefeed, identifier))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		if err := tx.DeleteBucket([]byte(shard)); err != nil && err != bolt.ErrBucketNotFound {
+			return err
+		}
+		return nil
+	}))
+}
+
+func requireRowIndexShardExists(t *testing.T, root string, changefeed string, identifier []string, shard string) {
+	t.Helper()
+	db, err := openCommittedRowIndexDB(committedRowIndexPath(root, changefeed, identifier))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		require.NotNil(t, tx.Bucket([]byte(shard)))
+		return nil
+	}))
+}
+
+func rowIndexShardHashes(t *testing.T, root string, changefeed string, identifier []string, shard string) []string {
+	t.Helper()
+	db, err := openCommittedRowIndexDB(committedRowIndexPath(root, changefeed, identifier))
+	require.NoError(t, err)
+	defer db.Close()
+
+	hashes := make([]string, 0)
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(shard))
+		require.NotNil(t, bucket)
+		return bucket.ForEach(func(key []byte, _ []byte) error {
+			hashes = append(hashes, string(key))
+			return nil
+		})
+	}))
+	return hashes
+}
+
 func rowIDInIndexShard(prefix string, shard string) string {
 	for i := 0; ; i++ {
 		rowID := fmt.Sprintf("%s-%06d", prefix, i)
 		if committedRowIndexShard(rowID) == shard {
+			return rowID
+		}
+	}
+}
+
+func rowIDOutsideIndexShard(prefix string, shard string) string {
+	for i := 0; ; i++ {
+		rowID := fmt.Sprintf("%s-%06d", prefix, i)
+		if committedRowIndexShard(rowID) != shard {
 			return rowID
 		}
 	}
