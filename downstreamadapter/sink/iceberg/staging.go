@@ -420,18 +420,22 @@ func stagingRowIDForEvent(
 	rowKey []byte,
 	row map[string]any,
 ) (string, error) {
+	var rowIndexValue *int
+	if len(rowKey) == 0 {
+		rowIndexValue = &rowIndex
+	}
 	payload := struct {
 		TableID  int64          `json:"table_id"`
 		StartTs  uint64         `json:"start_ts"`
 		CommitTs uint64         `json:"commit_ts"`
-		RowIndex int            `json:"row_index"`
+		RowIndex *int           `json:"row_index,omitempty"`
 		RowKey   []byte         `json:"row_key,omitempty"`
 		Row      map[string]any `json:"row"`
 	}{
 		TableID:  tableID,
 		StartTs:  startTs,
 		CommitTs: commitTs,
-		RowIndex: rowIndex,
+		RowIndex: rowIndexValue,
 		RowKey:   rowKey,
 		Row:      stagingRowIdentityPayload(row),
 	}

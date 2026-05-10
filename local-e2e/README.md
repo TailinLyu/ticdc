@@ -185,16 +185,20 @@ timing luck.
 
 ## Current Limitations Found
 
-The matrix is intentionally not all green. The non-green rows are documented in
+The historical matrix and fresh reruns are documented in
 `ICEBERG_RESILIENCE_RESULTS.md` and summarized in `TEST_FAILURES.md`.
 
-Main correctness gaps:
+Resolved in the latest local loop:
 
-- A staged batch can be appended to Iceberg and then appended again after
-  committer failure if the staged file survives append. This affects S03, S11,
-  S19, and appears in rolling restart S20.
-- A writer can stage a file, fail before `PostFlush`, and replay the same event
-  from upstream while the durable staged file is also drained. This affects S05.
+- The deterministic replay windows S03, S05, and S11 now read back exact counts
+  and drain staging to zero.
+- The rolling restart replay scenario S20 now reads back exact counts.
+- Iceberg REST outage recovery S09 now drains automatically after REST returns,
+  without a TiCDC restart.
+- The high-volume staged drain S12 now passes at `10000/1000/666` local events.
+
+Remaining intentional limitations:
+
 - Multiple changefeeds writing the same Iceberg target table are unsupported.
   The sink now records a target-owner marker under the shared warehouse and
   rejects a second owner before appending, including across TiCDC clusters that
@@ -202,19 +206,12 @@ Main correctness gaps:
 - MinIO/S3-compatible coverage exists for the owner marker through
   `run_s16_minio_owner_marker.sh`; staged files are still local/shared-path
   JSON and need follow-up before S3-native high-throughput staging.
-- Iceberg REST DNS/catalog outage did not recover automatically after REST came
-  back; TiCDC restart drained the backlog. This affects S09.
-- The local Tabulario REST catalog uses a SQLite/JDBC backend and became the
-  bottleneck under the largest staged-drain stress run. This affects S12.
-- DDL row counts are correct, but Iceberg schema evolution is limited. Added
-  columns did not appear in the existing Iceberg `data` struct, dropped columns
-  remained nullable, rename maps to a new target, and truncate does not remove
-  old Iceberg rows. This affects S17.
+- Iceberg schema evolution DDL is unsupported. The local S17 script verifies that
+  DDL is rejected explicitly instead of silently producing partial schema
+  semantics.
 
-The highest-priority follow-up is an idempotency protocol: stable batch IDs plus
-a durable committed-batch marker or equivalent target-table commit ledger, so a
-replacement committer can distinguish "already appended" from "not yet
-appended" before draining retained staged files.
+The highest-priority follow-up is replacing JSON row staging with Iceberg-native
+data-file committables and a target-level commit protocol.
 
 ## Verification Commands
 
@@ -225,10 +222,17 @@ go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg \
   ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1
 ```
 
-The same-target unsupported guard can be rerun with:
+The fresh replay/hardening scripts can be rerun with:
 
 ```bash
+local-e2e/run_s03_append_exit_replay.sh
+local-e2e/run_s05_stage_exit_replay.sh
+local-e2e/run_s09_catalog_outage_recovery.sh
+local-e2e/run_s11_append_error_replay.sh
+local-e2e/run_s12_high_volume_drain.sh
 local-e2e/run_s15_owner_guard.sh
+local-e2e/run_s17_schema_unsupported.sh
+local-e2e/run_s20_rolling_restart.sh
 ```
 
 The S3-compatible warehouse owner-marker coverage uses the local MinIO service:

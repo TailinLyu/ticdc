@@ -15,6 +15,7 @@ package iceberg
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"time"
 
 	"github.com/pingcap/ticdc/pkg/common"
@@ -83,12 +84,20 @@ func buildPayloadRows(event *commonEvent.DMLEvent) ([]map[string]any, error) {
 		default:
 			return nil, errors.Errorf("unsupported iceberg row type %d", row.RowType)
 		}
+		rowKey := row.RowKey
+		if len(rowKey) == 0 {
+			var keyErr error
+			rowKey, keyErr = fallbackRowKeyForPayload(event.TableInfo, payload)
+			if keyErr != nil {
+				return nil, errors.Trace(keyErr)
+			}
+		}
 		rowID, err := stagingRowIDForEvent(
 			event.PhysicalTableID,
 			event.StartTs,
 			event.CommitTs,
 			len(rows),
-			row.RowKey,
+			rowKey,
 			payload)
 		if err != nil {
 			return nil, errors.Trace(err)
@@ -97,6 +106,82 @@ func buildPayloadRows(event *commonEvent.DMLEvent) ([]map[string]any, error) {
 		rows = append(rows, payload)
 	}
 	return rows, nil
+}
+
+func fallbackRowKeyForPayload(tableInfo *common.TableInfo, payload map[string]any) ([]byte, error) {
+	if tableInfo == nil {
+		return nil, nil
+	}
+	keyColumnIDs := logicalKeyColumnIDs(tableInfo)
+	if len(keyColumnIDs) == 0 {
+		return nil, nil
+	}
+	rowValues := payloadKeyValues(payload)
+	if len(rowValues) == 0 {
+		return nil, nil
+	}
+
+	values := make(map[string]any, len(keyColumnIDs))
+	for _, colID := range keyColumnIDs {
+		col := columnByID(tableInfo, colID)
+		if col == nil || col.IsVirtualGenerated() {
+			return nil, nil
+		}
+		value, ok := rowValues[col.Name.O]
+		if !ok || value == nil {
+			return nil, nil
+		}
+		values[col.Name.O] = value
+	}
+	if len(values) == 0 {
+		return nil, nil
+	}
+
+	encoded, err := json.Marshal(struct {
+		ColumnIDs []int64        `json:"column_ids"`
+		Values    map[string]any `json:"values"`
+	}{
+		ColumnIDs: append([]int64(nil), keyColumnIDs...),
+		Values:    values,
+	})
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return encoded, nil
+}
+
+func logicalKeyColumnIDs(tableInfo *common.TableInfo) []int64 {
+	if tableInfo == nil {
+		return nil
+	}
+	if pk := tableInfo.GetPKIndex(); len(pk) > 0 {
+		return pk
+	}
+	for _, index := range tableInfo.GetIndexColumns() {
+		if len(index) > 0 {
+			return index
+		}
+	}
+	return nil
+}
+
+func payloadKeyValues(payload map[string]any) map[string]any {
+	if values, ok := payload["data"].(map[string]any); ok && len(values) > 0 {
+		return values
+	}
+	if values, ok := payload["old"].(map[string]any); ok && len(values) > 0 {
+		return values
+	}
+	return nil
+}
+
+func columnByID(tableInfo *common.TableInfo, colID int64) *timodel.ColumnInfo {
+	for _, col := range tableInfo.GetColumns() {
+		if col.ID == colID {
+			return col
+		}
+	}
+	return nil
 }
 
 func rowToPayloadMap(row *chunk.Row, tableInfo *common.TableInfo) (map[string]any, error) {

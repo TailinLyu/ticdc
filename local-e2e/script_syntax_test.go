@@ -24,8 +24,15 @@ import (
 func TestLocalE2EScriptsAreParseable(t *testing.T) {
 	scripts := []string{
 		"iceberg_case_lib.sh",
+		"run_s03_append_exit_replay.sh",
+		"run_s05_stage_exit_replay.sh",
+		"run_s09_catalog_outage_recovery.sh",
+		"run_s11_append_error_replay.sh",
+		"run_s12_high_volume_drain.sh",
 		"run_s15_owner_guard.sh",
 		"run_s16_minio_owner_marker.sh",
+		"run_s17_schema_unsupported.sh",
+		"run_s20_rolling_restart.sh",
 	}
 	for _, script := range scripts {
 		t.Run(script, func(t *testing.T) {

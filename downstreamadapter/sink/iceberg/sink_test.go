@@ -984,6 +984,40 @@ func TestStageWriteIsDeterministicAcrossReplaySeq(t *testing.T) {
 	require.Equal(t, []string{"stable-row-id"}, files[0].batch.RowIDs)
 }
 
+func TestStagingRowIDIgnoresReplaySplitIndexWhenRowKeyIsPresent(t *testing.T) {
+	row := map[string]any{
+		"_op":        "I",
+		"_commit_ts": int64(10),
+		"_start_ts":  int64(9),
+		"_table_id":  int64(101),
+		"data":       map[string]any{"id": int64(1), "name": "first"},
+	}
+
+	first, err := stagingRowIDForEvent(101, 9, 10, 0, []byte("pk:1"), row)
+	require.NoError(t, err)
+	replayed, err := stagingRowIDForEvent(101, 9, 10, 7, []byte("pk:1"), row)
+	require.NoError(t, err)
+
+	require.Equal(t, first, replayed)
+}
+
+func TestStagingRowIDKeepsSplitIndexWhenRowKeyIsAbsent(t *testing.T) {
+	row := map[string]any{
+		"_op":        "I",
+		"_commit_ts": int64(10),
+		"_start_ts":  int64(9),
+		"_table_id":  int64(101),
+		"data":       map[string]any{"name": "same"},
+	}
+
+	first, err := stagingRowIDForEvent(101, 9, 10, 0, nil, row)
+	require.NoError(t, err)
+	replayed, err := stagingRowIDForEvent(101, 9, 10, 7, nil, row)
+	require.NoError(t, err)
+
+	require.NotEqual(t, first, replayed)
+}
+
 func TestWriteBlockEventRejectsDDL(t *testing.T) {
 	ctx := context.Background()
 	writer := &recordingAppendWriter{}

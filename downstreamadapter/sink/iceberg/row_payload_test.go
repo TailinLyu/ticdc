@@ -94,8 +94,31 @@ func TestBuildPayloadRowsUsesStableStagingRowIDAcrossReplaySeq(t *testing.T) {
 	require.Equal(t, firstRows[0][stagingRowIDField], replayedRows[0][stagingRowIDField])
 }
 
-func TestBuildPayloadRowsDistinguishesIdenticalRowsInSameEvent(t *testing.T) {
+func TestBuildPayloadRowsUsesStableKeyAcrossReplaySplit(t *testing.T) {
 	tableInfo := newPayloadTestTableInfo()
+
+	first := newPayloadTestEvent(tableInfo, 10, 20)
+	first.RowTypes = []common.RowType{common.RowTypeInsert, common.RowTypeInsert}
+	first.Length = 2
+	first.Rows = chunk.NewChunkWithCapacity(tableInfo.GetFieldSlice(), 2)
+	appendPayloadTestRow(first.Rows, 1, "alice")
+	appendPayloadTestRow(first.Rows, 2, "bob")
+
+	replayed := newPayloadTestEvent(tableInfo, 10, 20)
+	replayed.RowTypes = []common.RowType{common.RowTypeInsert}
+	replayed.Length = 1
+	replayed.Rows = chunk.NewChunkWithCapacity(tableInfo.GetFieldSlice(), 1)
+	appendPayloadTestRow(replayed.Rows, 2, "bob")
+
+	firstRows, err := buildPayloadRows(first)
+	require.NoError(t, err)
+	replayedRows, err := buildPayloadRows(replayed)
+	require.NoError(t, err)
+	require.Equal(t, firstRows[1][stagingRowIDField], replayedRows[0][stagingRowIDField])
+}
+
+func TestBuildPayloadRowsDistinguishesIdenticalRowsInSameEvent(t *testing.T) {
+	tableInfo := newPayloadTestTableInfoWithoutKey()
 
 	event := newPayloadTestEvent(tableInfo, 10, 20)
 	event.RowTypes = []common.RowType{common.RowTypeInsert, common.RowTypeInsert}
@@ -113,6 +136,15 @@ func TestBuildPayloadRowsDistinguishesIdenticalRowsInSameEvent(t *testing.T) {
 func newPayloadTestTableInfo() *common.TableInfo {
 	idType := types.NewFieldType(mysql.TypeLong)
 	idType.AddFlag(mysql.PriKeyFlag | mysql.NotNullFlag)
+	return newPayloadTestTableInfoWithIDType(idType)
+}
+
+func newPayloadTestTableInfoWithoutKey() *common.TableInfo {
+	idType := types.NewFieldType(mysql.TypeLong)
+	return newPayloadTestTableInfoWithIDType(idType)
+}
+
+func newPayloadTestTableInfoWithIDType(idType *types.FieldType) *common.TableInfo {
 	nameType := types.NewFieldType(mysql.TypeVarchar)
 	tableInfo := common.WrapTableInfo("app", &timodel.TableInfo{
 		ID:         101,

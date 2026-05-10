@@ -22,19 +22,37 @@ matrix.
 - The external-storage timeout wrapper preserves the underlying strong
   consistency marker, so S3/GCS/Azure-backed owner locks keep the consistency
   signal exposed by TiDB's storage layer.
+- Replayed DML row IDs are stable across processor restart splits when TiCDC
+  does not populate raw `RowKey`: the sink falls back to the table primary/handle
+  key and only uses row index for tables without a usable logical key.
+- Iceberg schema evolution DDL is explicitly unsupported for now. The sink fails
+  the changefeed instead of silently producing partial ADD/DROP/RENAME/TRUNCATE
+  semantics.
 
 ## Latest Local Evidence
 
-- Same-target S15 rerun:
-  `S15_OWNER_PASS cf_left=s15-owner-left-1778379359 cf_right=s15-owner-right-1778379359 summary=rows=116 inserts=100 updates=10 deletes=6 left_state=normal right_state=warning conflicts=5 metric_conflicts=1 staged_during=7 staged_after_remove=0 owner_markers_after_remove=0`
-- Repeatable local command:
-  `local-e2e/run_s15_owner_guard.sh`
-- MinIO/S3-compatible owner-marker rerun:
-  `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778378985`
-- Repeatable local command:
-  `local-e2e/run_s16_minio_owner_marker.sh`
-- Focused verification:
-  `go test ./coordinator ./downstreamadapter/sink ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/config ./pkg/metrics ./pkg/util ./local-e2e ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1`
+- Replay/crash reruns:
+  - `S03_REPLAY_PASS cf=s03-replay-1778388027 summary=rows=350 inserts=300 updates=30 deletes=20 staged_after=0 staged_after_remove=0`
+  - `S05_REPLAY_PASS cf=s05-replay-1778387908 summary=rows=350 inserts=300 updates=30 deletes=20 staged_after=0 staged_after_remove=0`
+  - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
+  - `S20_ROLLING_PASS cf=s20-restarts-1778387817 summary=rows=2333 inserts=2000 updates=200 deletes=133 staged_after=0 staged_after_remove=0`
+- Catalog and drain reruns:
+  - `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0`
+  - `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0`
+- Unsupported/owner-guard reruns:
+  - `S15_OWNER_PASS cf_left=s15-owner-left-1778388335 cf_right=s15-owner-right-1778388335 summary=rows=116 inserts=100 updates=10 deletes=6 left_state=warning right_state=normal conflicts=5 metric_conflicts=1 staged_during=7 staged_after_remove=0 owner_markers_after_remove=0`
+  - `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778388358`
+  - `S17_SCHEMA_UNSUPPORTED_PASS cf=s17-unsupported-1778388281 summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`
+- Repeatable local commands:
+  `local-e2e/run_s03_append_exit_replay.sh`,
+  `local-e2e/run_s05_stage_exit_replay.sh`,
+  `local-e2e/run_s09_catalog_outage_recovery.sh`,
+  `local-e2e/run_s11_append_error_replay.sh`,
+  `local-e2e/run_s12_high_volume_drain.sh`,
+  `local-e2e/run_s15_owner_guard.sh`,
+  `local-e2e/run_s16_minio_owner_marker.sh`,
+  `local-e2e/run_s17_schema_unsupported.sh`, and
+  `local-e2e/run_s20_rolling_restart.sh`.
 
 ## Remaining Production Hardening Loop
 
@@ -53,8 +71,9 @@ matrix.
   tables, aggressive checkpoint cadence, catalog outage/recovery, and staged
   backlog drain limits. A single laptop cannot prove 30GB/s, but it can catch
   algorithmic O(N) and unbounded backlog behavior.
-- Finish schema-evolution semantics for ADD/DROP/RENAME/TRUNCATE instead of
-  treating the sink as only an append-log row-count target.
+- Keep ADD/DROP/RENAME/TRUNCATE DDL unsupported until the DDL barrier and Iceberg
+  schema-update protocol are implemented. The current local check verifies the
+  rejection path, not schema evolution support.
 
 ## Design Comparison Notes
 

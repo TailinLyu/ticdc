@@ -93,6 +93,8 @@ services:
 
   ticdc-1:
     image: local/ticdc-iceberg:e2e
+    environment:
+      GO_FAILPOINTS: ${TICDC_1_GO_FAILPOINTS:-}
     command:
       - server
       - --newarch
@@ -114,6 +116,8 @@ services:
 
   ticdc-2:
     image: local/ticdc-iceberg:e2e
+    environment:
+      GO_FAILPOINTS: ${TICDC_2_GO_FAILPOINTS:-}
     command:
       - server
       - --newarch
@@ -135,6 +139,8 @@ services:
 
   ticdc-3:
     image: local/ticdc-iceberg:e2e
+    environment:
+      GO_FAILPOINTS: ${TICDC_3_GO_FAILPOINTS:-}
     command:
       - server
       - --newarch

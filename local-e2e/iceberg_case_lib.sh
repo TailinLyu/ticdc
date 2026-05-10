@@ -146,6 +146,63 @@ stage_file_count() {
   find "${WAREHOUSE}/.ticdc-staging" -name '*.json' 2>/dev/null | wc -l | tr -d ' '
 }
 
+wait_stage_file_count() {
+  local expected="$1"
+  local timeout="${2:-120}"
+  local deadline=$((SECONDS + timeout))
+  local count
+  while (( SECONDS < deadline )); do
+    count="$(stage_file_count)"
+    if [[ "${count}" == "${expected}" ]]; then
+      printf '%s\n' "${count}"
+      return 0
+    fi
+    sleep 2
+  done
+  count="$(stage_file_count)"
+  if [[ "${count}" == "${expected}" ]]; then
+    printf '%s\n' "${count}"
+    return 0
+  fi
+  printf 'expected staged file count %s, got %s\n' "${expected}" "${count}" >&2
+  return 1
+}
+
+wait_stage_file_count_at_least() {
+  local minimum="$1"
+  local timeout="${2:-120}"
+  local deadline=$((SECONDS + timeout))
+  local count
+  while (( SECONDS < deadline )); do
+    count="$(stage_file_count)"
+    if (( count >= minimum )); then
+      printf '%s\n' "${count}"
+      return 0
+    fi
+    sleep 2
+  done
+  count="$(stage_file_count)"
+  if (( count >= minimum )); then
+    printf '%s\n' "${count}"
+    return 0
+  fi
+  printf 'expected at least %s staged files, got %s\n' "${minimum}" "${count}" >&2
+  return 1
+}
+
+wait_iceberg_rest() {
+  local timeout="${1:-120}"
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if curl -sf http://127.0.0.1:8181/v1/config >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  curl -sv http://127.0.0.1:8181/v1/config >/dev/null || true
+  return 1
+}
+
 table_id() {
   local db="$1"
   local table="$2"
@@ -178,4 +235,45 @@ log_services_for() {
 ensure_stack_healthy() {
   wait_captures 3 90
   go run ./local-e2e/workload --db ticdc_health_probe --tables t --rows 2 --workers 1 --batch 2 --split-regions 0 --reset >/dev/null
+}
+
+iceberg_failpoint() {
+  printf 'github.com/pingcap/ticdc/downstreamadapter/sink/iceberg/%s' "$1"
+}
+
+set_all_ticdc_failpoints() {
+  local expr="$1"
+  env \
+    TICDC_1_GO_FAILPOINTS="${expr}" \
+    TICDC_2_GO_FAILPOINTS="${expr}" \
+    TICDC_3_GO_FAILPOINTS="${expr}" \
+    ${COMPOSE} up -d --force-recreate --no-deps ticdc-1 ticdc-2 ticdc-3 >/dev/null
+}
+
+clear_all_ticdc_failpoints() {
+  env \
+    TICDC_1_GO_FAILPOINTS= \
+    TICDC_2_GO_FAILPOINTS= \
+    TICDC_3_GO_FAILPOINTS= \
+    ${COMPOSE} up -d --force-recreate --no-deps ticdc-1 ticdc-2 ticdc-3 >/dev/null
+  wait_captures 3 120
+}
+
+wait_failpoint_log() {
+  local failpoint="$1"
+  local deadline=$((SECONDS + ${2:-120}))
+  while ((SECONDS < deadline)); do
+    for service in ticdc-1 ticdc-2 ticdc-3; do
+      if docker logs --since=20m "ticdc-iceberg-e2e-${service}-1" 2>/dev/null |
+        rg -q "inject ${failpoint}"; then
+        return 0
+      fi
+    done
+    sleep 2
+  done
+  for service in ticdc-1 ticdc-2 ticdc-3; do
+    docker logs --since=20m "ticdc-iceberg-e2e-${service}-1" 2>/dev/null |
+      rg "IcebergSink|iceberg committer|iceberg writer" || true
+  done
+  return 1
 }
