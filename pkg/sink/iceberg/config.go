@@ -74,6 +74,9 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 	if cfg.Warehouse == "" {
 		return nil, fmt.Errorf("iceberg sink URI must include warehouse parameter")
 	}
+	if err := validateWarehouseScheme(cfg.Warehouse); err != nil {
+		return nil, err
+	}
 	if cfg.StagingDir != "" {
 		stagingDir, err := localPathFromURI(cfg.StagingDir)
 		if err != nil {
@@ -133,6 +136,19 @@ func defaultStagingPath(warehouse string) (string, error) {
 		return filepath.Join(warehousePath, ".ticdc-staging"), nil
 	}
 	return "", err
+}
+
+func validateWarehouseScheme(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid warehouse %q: %w", raw, err)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "", "file", "s3":
+		return nil
+	default:
+		return fmt.Errorf("unsupported iceberg warehouse scheme %q; supported schemes are local paths, file, and s3", parsed.Scheme)
+	}
 }
 
 func localPathFromURI(raw string) (string, error) {

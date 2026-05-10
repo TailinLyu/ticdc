@@ -13,7 +13,9 @@ TIMEOUT="${TIMEOUT:-180}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 DB="${DB:-ice_s17_unsupported_${RUN_ID}}"
 CF="${CF:-s17-unsupported-${RUN_ID}}"
+RULE="${RULE:-${DB}.orders}"
 DDL_SQL="${DDL_SQL:-ALTER TABLE ${DB}.orders ADD COLUMN extra VARCHAR(32)}"
+PASS_LABEL="${PASS_LABEL:-S17_SCHEMA_UNSUPPORTED_PASS}"
 
 cleanup() {
   remove_feed "${CF}" || true
@@ -34,7 +36,7 @@ go run ./local-e2e/workload \
   --reset \
   --prepare-only >/tmp/"${DB}"-prepare.json
 
-create_feed "${CF}" "${DB}.orders" "_cdc" ticdc-1
+create_feed "${CF}" "${RULE}" "_cdc" ticdc-1
 wait_feed_normal "${CF}" 120
 
 go run ./local-e2e/workload \
@@ -80,5 +82,5 @@ trap - EXIT
 sleep 5
 staged_after_remove="$(wait_stage_file_count 0 60)"
 
-printf 'S17_SCHEMA_UNSUPPORTED_PASS cf=%s summary=%s staged_before_ddl=%s state=%s staged_after_remove=%s\n' \
-  "${CF}" "${summary}" "${staged_before_ddl}" "${state}" "${staged_after_remove}"
+printf '%s cf=%s rule=%s ddl=%q summary=%s staged_before_ddl=%s state=%s staged_after_remove=%s\n' \
+  "${PASS_LABEL}" "${CF}" "${RULE}" "${DDL_SQL}" "${summary}" "${staged_before_ddl}" "${state}" "${staged_after_remove}"

@@ -31,13 +31,18 @@ import (
 	"github.com/pingcap/ticdc/pkg/errors"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
-	"github.com/pingcap/tidb/pkg/meta/model"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
 type appendWriter interface {
-	AppendRows(ctx context.Context, identifier []string, rows []map[string]any, snapshotProps iceberggo.Properties) error
+	AppendRows(
+		ctx context.Context,
+		identifier []string,
+		rows []map[string]any,
+		tableSchema *stagedTableSchema,
+		snapshotProps iceberggo.Properties,
+	) error
 	CommittedBatches(ctx context.Context, identifier []string) (map[string]struct{}, error)
 }
 
@@ -69,6 +74,7 @@ type sinkCommand struct {
 
 type tableBuffer struct {
 	identifier  []string
+	tableInfo   *common.TableInfo
 	rows        []map[string]any
 	events      []*commonEvent.DMLEvent
 	maxCommitTs uint64
@@ -76,6 +82,7 @@ type tableBuffer struct {
 
 type stagedDrainGroup struct {
 	identifier  []string
+	tableSchema *stagedTableSchema
 	files       []stagedFile
 	rows        []map[string]any
 	batchIDs    []string
@@ -96,17 +103,18 @@ var icebergFaultHooks = struct {
 }{}
 
 const (
-	snapshotBatchIDKey      = "ticdc.batch-id"
-	snapshotBatchIDsKey     = "ticdc.batch-ids"
-	snapshotBatchCountKey   = "ticdc.batch-count"
-	snapshotChangefeedKey   = "ticdc.changefeed"
-	snapshotOwnerIDKey      = "ticdc.owner-id"
-	snapshotCDCClusterIDKey = "ticdc.cdc-cluster-id"
-	snapshotUpstreamIDKey   = "ticdc.upstream-id"
-	tableOwnerKey           = "ticdc.owner-changefeed"
-	tableOwnerIDKey         = snapshotOwnerIDKey
-	tableCDCClusterIDKey    = snapshotCDCClusterIDKey
-	tableUpstreamIDKey      = snapshotUpstreamIDKey
+	snapshotBatchIDKey         = "ticdc.batch-id"
+	snapshotBatchIDsKey        = "ticdc.batch-ids"
+	snapshotBatchCountKey      = "ticdc.batch-count"
+	snapshotChangefeedKey      = "ticdc.changefeed"
+	snapshotOwnerIDKey         = "ticdc.owner-id"
+	snapshotCDCClusterIDKey    = "ticdc.cdc-cluster-id"
+	snapshotUpstreamIDKey      = "ticdc.upstream-id"
+	snapshotCommitBarrierTsKey = "ticdc.commit-barrier-ts"
+	tableOwnerKey              = "ticdc.owner-changefeed"
+	tableOwnerIDKey            = snapshotOwnerIDKey
+	tableCDCClusterIDKey       = snapshotCDCClusterIDKey
+	tableUpstreamIDKey         = snapshotUpstreamIDKey
 
 	maxStagedFilesPerCommit = 100
 	maxRowsPerCommit        = 5000
@@ -195,15 +203,7 @@ func (s *sink) WriteBlockEvent(event commonEvent.BlockEvent) error {
 }
 
 func isIgnorableIcebergDDL(event *commonEvent.DDLEvent) bool {
-	if event.IsBootstrap || event.NotSync {
-		return true
-	}
-	switch event.GetDDLType() {
-	case model.ActionCreateSchema, model.ActionCreateTable, model.ActionCreateTables:
-		return true
-	default:
-		return false
-	}
+	return event.IsBootstrap || event.NotSync
 }
 
 func (s *sink) AddCheckpointTs(ts uint64) {
@@ -233,11 +233,13 @@ func (s *sink) Close(removeChangefeed bool) {
 	}
 	s.closeTargetOwnerConflictMetric()
 	if err := s.stage.DeleteChangefeed(s.changefeedID.String()); err != nil {
+		s.recordCleanupFailure("changefeed_staging")
 		log.Warn("close iceberg sink, remove changefeed staging meet error",
 			zap.String("changefeed", s.changefeedID.String()),
 			zap.Error(err))
 	}
 	if err := icebergcfg.CleanupTargetOwnerClaims(context.Background(), s.cfg.Warehouse, s.ownerID); err != nil {
+		s.recordCleanupFailure("owner_marker")
 		log.Warn("close iceberg sink, remove warehouse target owner claim meet error",
 			zap.String("changefeed", s.changefeedID.String()),
 			zap.String("ownerID", s.ownerID),
@@ -351,6 +353,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 
 	writer, err := s.getWriter(ctx)
 	if err != nil {
+		s.recordAppendFailure("writer_init")
 		log.Warn("iceberg committer will retry after writer initialization failure",
 			zap.String("changefeed", s.changefeedID.String()),
 			zap.Error(err))
@@ -386,6 +389,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			var err error
 			committedBatches, err = writer.CommittedBatches(ctx, staged.batch.Identifier)
 			if err != nil {
+				s.recordAppendFailure("committed_batch_lookup")
 				log.Warn("iceberg committer will retry after committed batch lookup failure",
 					zap.String("changefeed", s.changefeedID.String()),
 					zap.Strings("identifier", staged.batch.Identifier),
@@ -419,10 +423,17 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		group := currentGroups[key]
 		if group == nil ||
 			len(group.batchIDs) >= maxStagedFilesPerCommit ||
-			len(uniqueRows) > 0 && len(group.rows)+len(uniqueRows) > maxRowsPerCommit {
-			group = &stagedDrainGroup{identifier: append([]string(nil), staged.batch.Identifier...)}
+			len(uniqueRows) > 0 && len(group.rows)+len(uniqueRows) > maxRowsPerCommit ||
+			!sameStagedTableSchema(group.tableSchema, staged.batch.TableSchema) {
+			group = &stagedDrainGroup{
+				identifier:  append([]string(nil), staged.batch.Identifier...),
+				tableSchema: staged.batch.TableSchema,
+			}
 			currentGroups[key] = group
 			groups = append(groups, group)
+		}
+		if group.tableSchema == nil {
+			group.tableSchema = staged.batch.TableSchema
 		}
 		group.files = append(group.files, staged)
 		group.rows = append(group.rows, uniqueRows...)
@@ -448,23 +459,24 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		}
 
 		props := iceberggo.Properties{
-			snapshotChangefeedKey:   s.changefeedID.String(),
-			snapshotOwnerIDKey:      s.ownerID,
-			snapshotCDCClusterIDKey: s.cfg.TiCDCClusterID,
-			snapshotUpstreamIDKey:   strconv.FormatUint(s.cfg.UpstreamID, 10),
-			"ticdc.commit-ts":       strconv.FormatUint(group.maxCommitTs, 10),
-			snapshotBatchIDsKey:     strings.Join(group.batchIDs, ","),
-			snapshotBatchCountKey:   strconv.Itoa(len(group.batchIDs)),
+			snapshotChangefeedKey:      s.changefeedID.String(),
+			snapshotOwnerIDKey:         s.ownerID,
+			snapshotCDCClusterIDKey:    s.cfg.TiCDCClusterID,
+			snapshotUpstreamIDKey:      strconv.FormatUint(s.cfg.UpstreamID, 10),
+			"ticdc.commit-ts":          strconv.FormatUint(group.maxCommitTs, 10),
+			snapshotBatchIDsKey:        strings.Join(group.batchIDs, ","),
+			snapshotBatchCountKey:      strconv.Itoa(len(group.batchIDs)),
+			snapshotCommitBarrierTsKey: strconv.FormatUint(checkpointTs, 10),
 		}
 		if len(group.batchIDs) == 1 {
 			props[snapshotBatchIDKey] = group.batchIDs[0]
 		}
-		if checkpointTs != 0 {
-			props["ticdc.checkpoint-ts"] = strconv.FormatUint(checkpointTs, 10)
-		}
-
-		if err := writer.AppendRows(ctx, group.identifier, group.rows, props); err != nil {
+		appendStart := time.Now()
+		if err := writer.AppendRows(ctx, group.identifier, group.rows, group.tableSchema, props); err != nil {
+			s.recordCommitDuration("error", time.Since(appendStart))
+			s.recordAppendFailure(appendFailureReason(err))
 			if errors.Is(err, errIcebergTargetOwnerConflict) || errors.Cause(err) == errIcebergTargetOwnerConflict {
+				s.recordTargetOwnerConflict(err)
 				return errors.Trace(err)
 			}
 			committed, checkErr := allBatchesCommitted(ctx, writer, group.identifier, group.batchIDs)
@@ -473,6 +485,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 					return errors.Trace(err)
 				}
 				continue
+			}
+			if checkErr != nil {
+				s.recordAppendFailure("commit_state_lookup")
 			}
 			log.Warn("iceberg committer will retry staged append after failure",
 				zap.String("changefeed", s.changefeedID.String()),
@@ -483,6 +498,8 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			s.resetWriter()
 			return nil
 		}
+		s.recordCommitDuration("success", time.Since(appendStart))
+		s.recordCommitSuccess(len(group.batchIDs), checkpointTs, group.maxCommitTs)
 		if err := runIcebergFaultHook(icebergFaultAfterAppendBeforeStageDelete); err != nil {
 			return errors.Trace(err)
 		}
@@ -531,31 +548,38 @@ func (s *sink) claimTargetOwners(ctx context.Context, stagedFiles []stagedFile) 
 		if _, ok := claimed[key]; ok {
 			continue
 		}
-		s.ownerClaimsMu.Lock()
-		_, cached := s.ownerClaims[key]
-		s.ownerClaimsMu.Unlock()
-		if cached {
-			claimed[key] = struct{}{}
-			continue
-		}
-		if err := s.stage.ClaimTargetOwner(ctx, s.changefeedID.String(), staged.batch.Identifier); err != nil {
-			s.recordTargetOwnerConflict(err)
-			return errors.Trace(err)
-		}
-		claim := icebergcfg.NewTargetOwnerClaim(
-			s.cfg.TiCDCClusterID,
-			s.cfg.UpstreamID,
-			s.changefeedID.String(),
-			staged.batch.Identifier)
-		if err := icebergcfg.ClaimTargetOwner(ctx, s.cfg.Warehouse, claim); err != nil {
-			s.recordTargetOwnerConflict(err)
+		if err := s.claimTargetOwner(ctx, staged.batch.Identifier); err != nil {
 			return errors.Trace(err)
 		}
 		claimed[key] = struct{}{}
-		s.ownerClaimsMu.Lock()
-		s.ownerClaims[key] = struct{}{}
-		s.ownerClaimsMu.Unlock()
 	}
+	return nil
+}
+
+func (s *sink) claimTargetOwner(ctx context.Context, identifier []string) error {
+	key := identifierKey(identifier)
+	s.ownerClaimsMu.Lock()
+	_, cached := s.ownerClaims[key]
+	s.ownerClaimsMu.Unlock()
+	if cached {
+		return nil
+	}
+	if err := s.stage.ClaimTargetOwner(ctx, s.changefeedID.String(), identifier); err != nil {
+		s.recordTargetOwnerConflict(err)
+		return errors.Trace(err)
+	}
+	claim := icebergcfg.NewTargetOwnerClaim(
+		s.cfg.TiCDCClusterID,
+		s.cfg.UpstreamID,
+		s.changefeedID.String(),
+		identifier)
+	if err := icebergcfg.ClaimTargetOwner(ctx, s.cfg.Warehouse, claim); err != nil {
+		s.recordTargetOwnerConflict(err)
+		return errors.Trace(err)
+	}
+	s.ownerClaimsMu.Lock()
+	s.ownerClaims[key] = struct{}{}
+	s.ownerClaimsMu.Unlock()
 	return nil
 }
 
@@ -567,6 +591,8 @@ func (s *sink) recordStageMetrics(stagedFiles []stagedFile, eligible []stagedFil
 	metrics.IcebergStagedFilesGauge.WithLabelValues(keyspace, changefeed, "eligible").Set(float64(len(eligible)))
 	metrics.IcebergStagedRowsGauge.WithLabelValues(keyspace, changefeed, "pending").Set(float64(pendingRows))
 	metrics.IcebergStagedRowsGauge.WithLabelValues(keyspace, changefeed, "eligible").Set(float64(eligibleRows))
+	metrics.IcebergStagedOldestAgeGauge.WithLabelValues(keyspace, changefeed, "pending").Set(stagedOldestAgeSeconds(stagedFiles))
+	metrics.IcebergStagedOldestAgeGauge.WithLabelValues(keyspace, changefeed, "eligible").Set(stagedOldestAgeSeconds(eligible))
 }
 
 func (s *sink) refreshStageMetrics(ctx context.Context, checkpointTs uint64) error {
@@ -586,6 +612,38 @@ func (s *sink) recordTargetOwnerConflict(err error) {
 		s.changefeedID.Keyspace(), s.changefeedID.Name()).Inc()
 }
 
+func (s *sink) recordCommitDuration(result string, duration time.Duration) {
+	metrics.IcebergCommitDurationHistogram.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Observe(duration.Seconds())
+}
+
+func (s *sink) recordCommitSuccess(batchCount int, checkpointTs uint64, maxCommitTs uint64) {
+	keyspace, changefeed := s.changefeedID.Keyspace(), s.changefeedID.Name()
+	metrics.IcebergCommittedBatchesCounter.WithLabelValues(keyspace, changefeed).Add(float64(batchCount))
+	if checkpointTs >= maxCommitTs {
+		metrics.IcebergCommitBarrierLagGauge.WithLabelValues(keyspace, changefeed).Set(float64(checkpointTs - maxCommitTs))
+		return
+	}
+	metrics.IcebergCommitBarrierLagGauge.WithLabelValues(keyspace, changefeed).Set(0)
+}
+
+func (s *sink) recordAppendFailure(reason string) {
+	metrics.IcebergAppendFailureCounter.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name(), reason).Inc()
+}
+
+func appendFailureReason(err error) string {
+	if errors.Is(err, errIcebergTargetOwnerConflict) || errors.Cause(err) == errIcebergTargetOwnerConflict {
+		return "owner_conflict"
+	}
+	return "append"
+}
+
+func (s *sink) recordCleanupFailure(reason string) {
+	metrics.IcebergCleanupFailureCounter.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name(), reason).Inc()
+}
+
 func (s *sink) closeMetrics() {
 	s.closeStageMetrics()
 	s.closeTargetOwnerConflictMetric()
@@ -597,6 +655,9 @@ func (s *sink) closeStageMetrics() {
 	metrics.IcebergStagedFilesGauge.DeleteLabelValues(keyspace, changefeed, "eligible")
 	metrics.IcebergStagedRowsGauge.DeleteLabelValues(keyspace, changefeed, "pending")
 	metrics.IcebergStagedRowsGauge.DeleteLabelValues(keyspace, changefeed, "eligible")
+	metrics.IcebergStagedOldestAgeGauge.DeleteLabelValues(keyspace, changefeed, "pending")
+	metrics.IcebergStagedOldestAgeGauge.DeleteLabelValues(keyspace, changefeed, "eligible")
+	metrics.IcebergCommitBarrierLagGauge.DeleteLabelValues(keyspace, changefeed)
 }
 
 func (s *sink) closeTargetOwnerConflictMetric() {
@@ -623,6 +684,26 @@ func stagedRows(stagedFiles []stagedFile) int {
 		rows += len(staged.batch.Rows)
 	}
 	return rows
+}
+
+func stagedOldestAgeSeconds(stagedFiles []stagedFile) float64 {
+	var oldest time.Time
+	for _, staged := range stagedFiles {
+		if staged.batch.CreatedAt.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || staged.batch.CreatedAt.Before(oldest) {
+			oldest = staged.batch.CreatedAt
+		}
+	}
+	if oldest.IsZero() {
+		return 0
+	}
+	age := time.Since(oldest)
+	if age < 0 {
+		return 0
+	}
+	return age.Seconds()
 }
 
 func stagedGroupSafeToDelete(group *stagedDrainGroup, checkpointTs uint64) bool {
@@ -675,6 +756,7 @@ func allBatchesCommitted(ctx context.Context, writer appendWriter, identifier []
 func (s *sink) deleteStagedFiles(files []stagedFile) error {
 	for _, staged := range files {
 		if err := s.stage.Delete(staged.path); err != nil {
+			s.recordCleanupFailure("staged_file_delete")
 			return errors.Trace(err)
 		}
 	}
@@ -696,7 +778,10 @@ func (s *sink) stageTable(ctx context.Context, buffers map[string]*tableBuffer, 
 		return nil
 	}
 
-	if err := s.stage.Write(ctx, s.changefeedID.String(), buffer.identifier, buffer.rows, buffer.maxCommitTs); err != nil {
+	if err := s.claimTargetOwner(ctx, buffer.identifier); err != nil {
+		return errors.Trace(err)
+	}
+	if err := s.stage.Write(ctx, s.changefeedID.String(), buffer.identifier, buffer.rows, buffer.maxCommitTs, buffer.tableInfo); err != nil {
 		return errors.Trace(err)
 	}
 	if err := runIcebergFaultHook(icebergFaultAfterStageBeforePostFlush); err != nil {
@@ -745,8 +830,11 @@ func (s *sink) bufferEvent(buffers map[string]*tableBuffer, event *commonEvent.D
 	key := identifierKey(identifier)
 	buffer := buffers[key]
 	if buffer == nil {
-		buffer = &tableBuffer{identifier: identifier}
+		buffer = &tableBuffer{identifier: identifier, tableInfo: event.TableInfo}
 		buffers[key] = buffer
+	}
+	if buffer.tableInfo == nil {
+		buffer.tableInfo = event.TableInfo
 	}
 	buffer.rows = append(buffer.rows, rows...)
 	buffer.events = append(buffer.events, event)

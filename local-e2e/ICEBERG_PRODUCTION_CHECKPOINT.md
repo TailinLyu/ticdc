@@ -8,6 +8,8 @@ matrix.
 
 ## Current Decisions
 
+- The v1 product contract is an append-only CDC log sink. It does not model
+  Iceberg as the current TiDB table image.
 - Many-changefeed-to-one-Iceberg-target is unsupported for now.
 - The sink enforces that decision with a shared warehouse target-owner marker:
   `<warehouse>/.ticdc/iceberg-target-owners/<sha256(identifier)>.lock`.
@@ -17,32 +19,45 @@ matrix.
   the same target ownership fence.
 - TiCDC also writes owner metadata into Iceberg table properties and snapshot
   properties for audit and defense in depth.
-- The sink exposes initial Iceberg operator metrics for staged backlog and
-  target-owner conflicts.
-- The external-storage timeout wrapper preserves the underlying strong
-  consistency marker, so S3/GCS/Azure-backed owner locks keep the consistency
-  signal exposed by TiDB's storage layer.
+- Target warehouses are locked to local paths, `file://`, and `s3://`
+  S3-compatible warehouses. Non-local warehouses require an explicit local/shared
+  `staging-dir` while JSON staging remains in this PR. Other cloud warehouse
+  schemes are rejected instead of being silently accepted.
+- The sink exposes initial Iceberg operator metrics for staged backlog, oldest
+  staged age, commit latency/result, committed batch count, commit-barrier lag,
+  append failures, cleanup failures, and target-owner conflicts.
 - Replayed DML row IDs are stable across processor restart splits when TiCDC
   does not populate raw `RowKey`: the sink falls back to the table primary/handle
   key and only uses row index for tables without a usable logical key.
-- Iceberg schema evolution DDL is explicitly unsupported for now. The sink fails
-  the changefeed instead of silently producing partial ADD/DROP/RENAME/TRUNCATE
-  semantics.
+- Iceberg schema evolution DDL and live `CREATE TABLE` DDL are explicitly
+  unsupported for now. Bootstrap/not-sync create DDL remains allowed. Unsupported
+  live DDL fails the changefeed instead of silently producing partial semantics.
+- Iceberg snapshots use `ticdc.commit-barrier-ts` for the advertised barrier
+  contract. The older `ticdc.checkpoint-ts` property is no longer emitted.
+- New tables are created from TiDB `TableInfo`, not from the first non-null
+  observed row values, and use identity partition fields `dt` and `hr`.
 
 ## Latest Local Evidence
 
+- Focused unit and helper packages:
+  - `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e -count=1`
 - Replay/crash reruns:
-  - `S03_REPLAY_PASS cf=s03-replay-1778388027 summary=rows=350 inserts=300 updates=30 deletes=20 staged_after=0 staged_after_remove=0`
-  - `S05_REPLAY_PASS cf=s05-replay-1778387908 summary=rows=350 inserts=300 updates=30 deletes=20 staged_after=0 staged_after_remove=0`
+  - `S03_REPLAY_PASS cf=s03-replay-1778391385 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S05_REPLAY_PASS cf=s05-replay-1778391501 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
-  - `S20_ROLLING_PASS cf=s20-restarts-1778387817 summary=rows=2333 inserts=2000 updates=200 deletes=133 staged_after=0 staged_after_remove=0`
+  - `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0`
 - Catalog and drain reruns:
   - `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0`
   - `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0`
 - Unsupported/owner-guard reruns:
-  - `S15_OWNER_PASS cf_left=s15-owner-left-1778388335 cf_right=s15-owner-right-1778388335 summary=rows=116 inserts=100 updates=10 deletes=6 left_state=warning right_state=normal conflicts=5 metric_conflicts=1 staged_during=7 staged_after_remove=0 owner_markers_after_remove=0`
+  - `S15_OWNER_PASS cf_left=s15-owner-left-1778391469 cf_right=s15-owner-right-1778391469 summary=rows=70 inserts=60 updates=6 deletes=4 left_state=normal right_state=warning conflicts=9 metric_conflicts=3 staged_during=0 staged_after_remove=0 owner_markers_after_remove=0`
   - `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778388358`
-  - `S17_SCHEMA_UNSUPPORTED_PASS cf=s17-unsupported-1778388281 summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`
+  - `S17_CREATE_TABLE_UNSUPPORTED_PASS cf=s17-create-unsupported-1778391432 rule=ice_s17_create_1778391432.* ddl=CREATE TABLE ice_s17_create_1778391432.orders_created (...) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`
+  - `S17_SCHEMA_UNSUPPORTED_PASS cf=s17-unsupported-1778391453 rule=ice_s17_unsupported_1778391453.orders ddl=ALTER TABLE ice_s17_unsupported_1778391453.orders ADD COLUMN extra VARCHAR(32) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`
+- Metadata check on `ice_s03_replay_1778391385.orders_cdc`:
+  - partition spec is `identity(dt)` and `identity(hr)`;
+  - snapshots contain `ticdc.commit-barrier-ts`;
+  - snapshots do not contain `ticdc.checkpoint-ts`.
 - Repeatable local commands:
   `local-e2e/run_s03_append_exit_replay.sh`,
   `local-e2e/run_s05_stage_exit_replay.sh`,
@@ -51,6 +66,7 @@ matrix.
   `local-e2e/run_s12_high_volume_drain.sh`,
   `local-e2e/run_s15_owner_guard.sh`,
   `local-e2e/run_s16_minio_owner_marker.sh`,
+  `local-e2e/run_s17_create_table_unsupported.sh`,
   `local-e2e/run_s17_schema_unsupported.sh`, and
   `local-e2e/run_s20_rolling_restart.sh`.
 
@@ -62,9 +78,9 @@ matrix.
 - Add a real per-Iceberg-target commit coordinator if many-source or
   many-changefeed-to-one-target must become supported. Until then, keep the
   warehouse owner marker as a hard rejection.
-- Expand metrics and alerts beyond the initial staged-backlog and target-owner
-  conflict signals to include committed batches, append latency, catalog retries,
-  checkpoint lag, and cleanup failures.
+- Add alert rules, dashboard panels, and a runbook on top of the new metrics.
+  Still missing explicit catalog retry counters and table-creation/schema-failure
+  counters.
 - Extend MinIO/S3-style integration coverage beyond the owner marker to include
   staged-file cleanup and eventually remote/native data-file staging.
 - Expand local scale tests by simulating thousands of changefeeds with many small

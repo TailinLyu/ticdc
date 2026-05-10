@@ -15,15 +15,51 @@ package iceberg
 
 import (
 	"encoding/json"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	iceberggo "github.com/apache/iceberg-go"
+	"github.com/pingcap/ticdc/pkg/common"
+	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
 )
+
+type stagedColumnType string
+
+const (
+	stagedColumnTypeBinary  stagedColumnType = "binary"
+	stagedColumnTypeBool    stagedColumnType = "bool"
+	stagedColumnTypeFloat64 stagedColumnType = "float64"
+	stagedColumnTypeInt64   stagedColumnType = "int64"
+	stagedColumnTypeString  stagedColumnType = "string"
+)
+
+type stagedColumnSchema struct {
+	Name string           `json:"name"`
+	Type stagedColumnType `json:"type"`
+}
+
+type stagedTableSchema struct {
+	Columns []stagedColumnSchema `json:"columns"`
+}
 
 func arrowSchemaForRows(rows []map[string]any) *arrow.Schema {
 	rowType := rowStructType(rows, "data", "old")
+	return cdcLogArrowSchema(rowType)
+}
 
+func arrowSchemaForTableInfo(tableInfo *common.TableInfo) *arrow.Schema {
+	return arrowSchemaForStagedTableSchema(stagedTableSchemaForTableInfo(tableInfo))
+}
+
+func arrowSchemaForStagedTableSchema(tableSchema *stagedTableSchema) *arrow.Schema {
+	rowType := rowStructTypeForTableSchema(tableSchema)
+	return cdcLogArrowSchema(rowType)
+}
+
+func cdcLogArrowSchema(rowType arrow.DataType) *arrow.Schema {
 	return arrow.NewSchema([]arrow.Field{
 		{Name: "_commit_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "_commit_dt", Type: arrow.BinaryTypes.String, Nullable: false},
@@ -36,6 +72,45 @@ func arrowSchemaForRows(rows []map[string]any) *arrow.Schema {
 		{Name: "data", Type: rowType, Nullable: true},
 		{Name: "old", Type: rowType, Nullable: true},
 	}, nil)
+}
+
+func stagedTableSchemaForTableInfo(tableInfo *common.TableInfo) *stagedTableSchema {
+	if tableInfo == nil {
+		return nil
+	}
+	columns := make([]stagedColumnSchema, 0, len(tableInfo.GetColumns()))
+	for _, col := range tableInfo.GetColumns() {
+		if col.IsVirtualGenerated() {
+			continue
+		}
+		columns = append(columns, stagedColumnSchema{
+			Name: col.Name.O,
+			Type: stagedColumnTypeForColumn(col),
+		})
+	}
+	return &stagedTableSchema{Columns: columns}
+}
+
+func sameStagedTableSchema(left *stagedTableSchema, right *stagedTableSchema) bool {
+	switch {
+	case left == nil && right == nil:
+		return true
+	case left == nil || right == nil:
+		return false
+	default:
+		return slices.Equal(left.Columns, right.Columns)
+	}
+}
+
+func rowStructTypeForTableSchema(tableSchema *stagedTableSchema) arrow.DataType {
+	if tableSchema == nil {
+		return arrow.StructOf()
+	}
+	fields := make([]arrow.Field, 0, len(tableSchema.Columns))
+	for _, col := range tableSchema.Columns {
+		fields = append(fields, arrow.Field{Name: col.Name, Type: arrowTypeForStagedColumn(col.Type), Nullable: true})
+	}
+	return arrow.StructOf(fields...)
 }
 
 func rowStructType(rows []map[string]any, fieldNames ...string) arrow.DataType {
@@ -67,6 +142,45 @@ func rowStructType(rows []map[string]any, fieldNames ...string) arrow.DataType {
 	return arrow.StructOf(fields...)
 }
 
+func stagedColumnTypeForColumn(col *timodel.ColumnInfo) stagedColumnType {
+	switch col.GetType() {
+	case mysql.TypeVarchar, mysql.TypeString, mysql.TypeVarString,
+		mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob, mysql.TypeBlob:
+		if mysql.HasBinaryFlag(col.GetFlag()) {
+			return stagedColumnTypeBinary
+		}
+		return stagedColumnTypeString
+	case mysql.TypeFloat, mysql.TypeDouble:
+		return stagedColumnTypeFloat64
+	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong,
+		mysql.TypeYear, mysql.TypeBit:
+		return stagedColumnTypeInt64
+	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeNewDate, mysql.TypeTimestamp,
+		mysql.TypeDuration, mysql.TypeEnum, mysql.TypeSet, mysql.TypeNewDecimal,
+		mysql.TypeJSON, mysql.TypeTiDBVectorFloat32:
+		return stagedColumnTypeString
+	default:
+		return stagedColumnTypeString
+	}
+}
+
+func arrowTypeForStagedColumn(columnType stagedColumnType) arrow.DataType {
+	switch columnType {
+	case stagedColumnTypeBinary:
+		return arrow.BinaryTypes.Binary
+	case stagedColumnTypeBool:
+		return arrow.FixedWidthTypes.Boolean
+	case stagedColumnTypeFloat64:
+		return arrow.PrimitiveTypes.Float64
+	case stagedColumnTypeInt64:
+		return arrow.PrimitiveTypes.Int64
+	case stagedColumnTypeString:
+		return arrow.BinaryTypes.String
+	default:
+		return arrow.BinaryTypes.String
+	}
+}
+
 func arrowTypeForValue(value any) arrow.DataType {
 	switch value.(type) {
 	case bool:
@@ -89,4 +203,15 @@ func arrowTypeForValue(value any) arrow.DataType {
 	default:
 		return arrow.BinaryTypes.String
 	}
+}
+
+func cdcLogPartitionSpec(schema *iceberggo.Schema) (*iceberggo.PartitionSpec, error) {
+	spec, err := iceberggo.NewPartitionSpecOpts(
+		iceberggo.AddPartitionFieldByName("dt", "dt", iceberggo.IdentityTransform{}, schema, nil),
+		iceberggo.AddPartitionFieldByName("hr", "hr", iceberggo.IdentityTransform{}, schema, nil),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &spec, nil
 }

@@ -25,18 +25,20 @@ import (
 	"sort"
 	"time"
 
+	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/errors"
 	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
 )
 
 type stagedBatch struct {
-	Changefeed  string           `json:"changefeed"`
-	BatchID     string           `json:"batch_id"`
-	Identifier  []string         `json:"identifier"`
-	Rows        []map[string]any `json:"rows"`
-	RowIDs      []string         `json:"row_ids,omitempty"`
-	MaxCommitTs uint64           `json:"max_commit_ts"`
-	CreatedAt   time.Time        `json:"created_at"`
+	Changefeed  string             `json:"changefeed"`
+	BatchID     string             `json:"batch_id"`
+	Identifier  []string           `json:"identifier"`
+	TableSchema *stagedTableSchema `json:"table_schema,omitempty"`
+	Rows        []map[string]any   `json:"rows"`
+	RowIDs      []string           `json:"row_ids,omitempty"`
+	MaxCommitTs uint64             `json:"max_commit_ts"`
+	CreatedAt   time.Time          `json:"created_at"`
 }
 
 type stagedFile struct {
@@ -64,6 +66,7 @@ func (s *stageStore) Write(
 	identifier []string,
 	rows []map[string]any,
 	maxCommitTs uint64,
+	tableInfo ...*common.TableInfo,
 ) error {
 	if len(rows) == 0 {
 		return nil
@@ -111,6 +114,7 @@ func (s *stageStore) Write(
 		Changefeed:  changefeed,
 		BatchID:     batchID,
 		Identifier:  append([]string(nil), identifier...),
+		TableSchema: firstStagedTableSchema(tableInfo),
 		Rows:        stagedRows,
 		RowIDs:      rowIDs,
 		MaxCommitTs: maxCommitTs,
@@ -131,6 +135,13 @@ func (s *stageStore) Write(
 	}
 	cleanup = false
 	return nil
+}
+
+func firstStagedTableSchema(tableInfo []*common.TableInfo) *stagedTableSchema {
+	if len(tableInfo) == 0 {
+		return nil
+	}
+	return stagedTableSchemaForTableInfo(tableInfo[0])
 }
 
 func (s *stageStore) List(ctx context.Context, changefeed string) ([]stagedFile, error) {

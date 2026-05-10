@@ -60,7 +60,7 @@ From the TiCDC repo root:
 
 ```bash
 # Build a failpoint-enabled TiCDC binary for the local Docker image.
-GOOS=linux GOARCH=arm64 CGO=0 make build-cdc-with-failpoint
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 make build-cdc-with-failpoint
 cp bin/cdc bin/cdc-linux-arm64
 
 # Build the local TiCDC image.
@@ -202,13 +202,20 @@ Remaining intentional limitations:
 - Multiple changefeeds writing the same Iceberg target table are unsupported.
   The sink now records a target-owner marker under the shared warehouse and
   rejects a second owner before appending, including across TiCDC clusters that
-  share an S3/file warehouse. This affects S15 and S24.
+  share an S3/file warehouse. The writer claims the target before exposing a
+  staged file, so a doomed same-target feed does not advance source progress or
+  leave rows for the committer. This affects S15 and S24.
 - MinIO/S3-compatible coverage exists for the owner marker through
   `run_s16_minio_owner_marker.sh`; staged files are still local/shared-path
   JSON and need follow-up before S3-native high-throughput staging.
-- Iceberg schema evolution DDL is unsupported. The local S17 script verifies that
-  DDL is rejected explicitly instead of silently producing partial schema
-  semantics.
+- Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
+  `run_s17_schema_unsupported.sh` and
+  `run_s17_create_table_unsupported.sh` verify that live DDL is rejected
+  explicitly instead of silently producing partial semantics. Bootstrap/not-sync
+  create DDL is still allowed.
+- Iceberg tables are created from TiDB `TableInfo`, with `dt` and `hr` identity
+  partition fields. Snapshot summaries use `ticdc.commit-barrier-ts`; the older
+  `ticdc.checkpoint-ts` name is not emitted.
 
 The highest-priority follow-up is replacing JSON row staging with Iceberg-native
 data-file committables and a target-level commit protocol.
@@ -231,6 +238,7 @@ local-e2e/run_s09_catalog_outage_recovery.sh
 local-e2e/run_s11_append_error_replay.sh
 local-e2e/run_s12_high_volume_drain.sh
 local-e2e/run_s15_owner_guard.sh
+local-e2e/run_s17_create_table_unsupported.sh
 local-e2e/run_s17_schema_unsupported.sh
 local-e2e/run_s20_rolling_restart.sh
 ```

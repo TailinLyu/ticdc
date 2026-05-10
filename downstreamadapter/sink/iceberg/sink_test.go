@@ -36,9 +36,10 @@ import (
 )
 
 type appendCall struct {
-	identifier []string
-	rows       []map[string]any
-	props      iceberggo.Properties
+	identifier  []string
+	rows        []map[string]any
+	tableSchema *stagedTableSchema
+	props       iceberggo.Properties
 }
 
 type recordingAppendWriter struct {
@@ -53,6 +54,7 @@ func (r *recordingAppendWriter) AppendRows(
 	_ context.Context,
 	identifier []string,
 	rows []map[string]any,
+	tableSchema *stagedTableSchema,
 	props iceberggo.Properties,
 ) error {
 	r.mu.Lock()
@@ -62,9 +64,10 @@ func (r *recordingAppendWriter) AppendRows(
 		return err
 	}
 	call := appendCall{
-		identifier: append([]string(nil), identifier...),
-		rows:       append([]map[string]any(nil), rows...),
-		props:      props,
+		identifier:  append([]string(nil), identifier...),
+		rows:        append([]map[string]any(nil), rows...),
+		tableSchema: tableSchema,
+		props:       props,
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -173,7 +176,8 @@ func TestSinkFlushesRowsOnCheckpoint(t *testing.T) {
 	calls := writer.getCalls()
 	require.Equal(t, []string{"test", "orders_cdc"}, calls[0].identifier)
 	require.Len(t, calls[0].rows, 1)
-	require.Equal(t, "42", calls[0].props["ticdc.checkpoint-ts"])
+	require.NotContains(t, calls[0].props, "ticdc.checkpoint-ts")
+	require.Equal(t, "42", calls[0].props[snapshotCommitBarrierTsKey])
 	require.Equal(t, "1", calls[0].props["ticdc.commit-ts"])
 	require.Zero(t, stageFileCount(t, cfg.StagingDir))
 
@@ -251,6 +255,42 @@ func TestNonCommitterStagesRowsWhenBatchRowsReached(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("event was not post-flushed after durable staging")
 	}
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+func TestStageFileCarriesTableInfoSchema(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1)
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-test"), cfg, writer)
+
+	tableInfo := newPayloadTestTableInfo()
+	tableInfo.TableName = common.TableName{Schema: "test", Table: "orders", TableID: 101}
+	event := newSinkTestInsertEvent(tableInfo, 9, int64(2), "")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddDMLEvent(event)
+	require.Eventually(t, func() bool {
+		return stageFileCount(t, cfg.StagingDir) == 1
+	}, 3*time.Second, 10*time.Millisecond)
+
+	stage := newStageStore(cfg.StagingDir)
+	files, err := stage.List(ctx, s.changefeedID.String())
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	require.NotNil(t, files[0].batch.TableSchema)
+	require.Equal(t, []stagedColumnSchema{
+		{Name: "id", Type: stagedColumnTypeInt64},
+		{Name: "name", Type: stagedColumnTypeString},
+	}, files[0].batch.TableSchema.Columns)
 
 	cancel()
 	require.NoError(t, <-errCh)
@@ -714,7 +754,8 @@ func TestCommitterLeavesFutureStagedBatchesUntilCheckpoint(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 1
 	}, 3*time.Second, 10*time.Millisecond)
-	require.Equal(t, "10", writer.getCalls()[0].props["ticdc.checkpoint-ts"])
+	require.Equal(t, "10", writer.getCalls()[0].props[snapshotCommitBarrierTsKey])
+	require.NotContains(t, writer.getCalls()[0].props, "ticdc.checkpoint-ts")
 
 	s.AddCheckpointTs(20)
 	require.Eventually(t, func() bool {
@@ -746,8 +787,8 @@ func TestSinkRecordsIcebergStagedBacklogMetrics(t *testing.T) {
 	defer s.closeMetrics()
 
 	stagedFiles := []stagedFile{
-		{batch: stagedBatch{Rows: []map[string]any{{"id": 1}, {"id": 2}}}},
-		{batch: stagedBatch{Rows: []map[string]any{{"id": 3}}}},
+		{batch: stagedBatch{Rows: []map[string]any{{"id": 1}, {"id": 2}}, CreatedAt: time.Now().Add(-2 * time.Second)}},
+		{batch: stagedBatch{Rows: []map[string]any{{"id": 3}}, CreatedAt: time.Now().Add(-1 * time.Second)}},
 	}
 	eligible := stagedFiles[:1]
 
@@ -761,6 +802,45 @@ func TestSinkRecordsIcebergStagedBacklogMetrics(t *testing.T) {
 		metrics.IcebergStagedRowsGauge.WithLabelValues("default", "iceberg-metrics", "pending")))
 	require.Equal(t, float64(2), testutil.ToFloat64(
 		metrics.IcebergStagedRowsGauge.WithLabelValues("default", "iceberg-metrics", "eligible")))
+	require.Greater(t, testutil.ToFloat64(
+		metrics.IcebergStagedOldestAgeGauge.WithLabelValues("default", "iceberg-metrics", "pending")), float64(0))
+	require.Greater(t, testutil.ToFloat64(
+		metrics.IcebergStagedOldestAgeGauge.WithLabelValues("default", "iceberg-metrics", "eligible")), float64(0))
+}
+
+func TestSinkRecordsIcebergCommitMetrics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-commit-metrics")
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), []string{"test", "orders_cdc"}, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+
+	s := newSink(ctx, changefeedID, cfg, writer)
+	defer s.closeMetrics()
+	s.SetTableSchemaStore(nil)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddCheckpointTs(20)
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		metrics.IcebergCommittedBatchesCounter.WithLabelValues("default", "iceberg-commit-metrics")))
+	require.Equal(t, float64(10), testutil.ToFloat64(
+		metrics.IcebergCommitBarrierLagGauge.WithLabelValues("default", "iceberg-commit-metrics")))
+
+	cancel()
+	require.NoError(t, <-errCh)
 }
 
 func TestClosePreservesOwnerConflictMetricUntilRemove(t *testing.T) {
@@ -792,6 +872,43 @@ func TestStageTargetOwnerClaimRejectsDifferentChangefeed(t *testing.T) {
 	err := stage.ClaimTargetOwner(ctx, "default/right", identifier)
 	require.Error(t, err)
 	require.Equal(t, errIcebergTargetOwnerConflict, cerror.Cause(err))
+}
+
+func TestWriterClaimsTargetOwnerBeforePostFlush(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := newSinkTestConfig(t, 1)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, stage.ClaimTargetOwner(ctx, "default/left", identifier))
+
+	writer := &recordingAppendWriter{}
+	right := common.NewChangefeedID4Test("default", "right")
+	s := newSink(ctx, right, cfg, writer)
+
+	tableInfo := newPayloadTestTableInfo()
+	tableInfo.TableName = common.TableName{Schema: "test", Table: "orders", TableID: 101}
+	event := newSinkTestInsertEvent(tableInfo, 10, int64(1), "blocked")
+	flushed := make(chan struct{})
+	event.AddPostFlushFunc(func() { close(flushed) })
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddDMLEvent(event)
+	select {
+	case <-flushed:
+		t.Fatal("event was post-flushed before target owner claim succeeded")
+	case err := <-errCh:
+		require.Error(t, err)
+		require.Equal(t, errIcebergTargetOwnerConflict, cerror.Cause(err))
+		require.Zero(t, stageFileCount(t, cfg.StagingDir))
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected target owner conflict before PostFlush")
+	}
 }
 
 func TestCommitterRejectsTargetOwnerClaimBeforeWriterInit(t *testing.T) {
@@ -1034,7 +1151,7 @@ func TestWriteBlockEventRejectsDDL(t *testing.T) {
 	require.False(t, flushed)
 }
 
-func TestWriteBlockEventAllowsCreateDDL(t *testing.T) {
+func TestWriteBlockEventRejectsLiveCreateDDL(t *testing.T) {
 	ctx := context.Background()
 	writer := &recordingAppendWriter{}
 	cfg := newSinkTestConfig(t, 1)
@@ -1044,6 +1161,27 @@ func TestWriteBlockEventAllowsCreateDDL(t *testing.T) {
 		Type:       byte(model.ActionCreateTable),
 		Query:      "create table orders(id bigint primary key)",
 		FinishedTs: 42,
+	}
+	flushed := false
+	ddl.AddPostFlushFunc(func() { flushed = true })
+
+	err := s.WriteBlockEvent(ddl)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "iceberg sink does not support block event")
+	require.False(t, flushed)
+}
+
+func TestWriteBlockEventAllowsBootstrapCreateDDL(t *testing.T) {
+	ctx := context.Background()
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1)
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-test"), cfg, writer)
+
+	ddl := &commonEvent.DDLEvent{
+		Type:        byte(model.ActionCreateTable),
+		Query:       "create table orders(id bigint primary key)",
+		FinishedTs:  42,
+		IsBootstrap: true,
 	}
 	flushed := false
 	ddl.AddPostFlushFunc(func() { flushed = true })

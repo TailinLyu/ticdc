@@ -18,6 +18,8 @@ import (
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	iceberggo "github.com/apache/iceberg-go"
+	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,4 +74,31 @@ func TestArrowSchemaForRowsUsesDataFieldsForOldStruct(t *testing.T) {
 		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
 	}, dataType.Fields())
 	require.Equal(t, dataType.Fields(), oldType.Fields())
+}
+
+func TestArrowSchemaForTableInfoIncludesColumnsWithoutObservedValues(t *testing.T) {
+	schema := arrowSchemaForTableInfo(newPayloadTestTableInfo())
+
+	dataType := schema.Field(8).Type.(*arrow.StructType)
+	oldType := schema.Field(9).Type.(*arrow.StructType)
+	require.Equal(t, []arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, dataType.Fields())
+	require.Equal(t, dataType.Fields(), oldType.Fields())
+}
+
+func TestCDCLogPartitionSpecUsesDtHrIdentity(t *testing.T) {
+	icebergSchema, err := icebergtable.ArrowSchemaToIcebergWithFreshIDs(
+		arrowSchemaForTableInfo(newPayloadTestTableInfo()), false)
+	require.NoError(t, err)
+
+	spec, err := cdcLogPartitionSpec(icebergSchema)
+	require.NoError(t, err)
+
+	require.Equal(t, 2, spec.NumFields())
+	require.Equal(t, "dt", spec.Field(0).Name)
+	require.Equal(t, iceberggo.IdentityTransform{}, spec.Field(0).Transform)
+	require.Equal(t, "hr", spec.Field(1).Name)
+	require.Equal(t, iceberggo.IdentityTransform{}, spec.Field(1).Transform)
 }

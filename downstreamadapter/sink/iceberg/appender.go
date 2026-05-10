@@ -56,6 +56,7 @@ func (a *icebergAppender) AppendRows(
 	ctx context.Context,
 	identifier []string,
 	rows []map[string]any,
+	tableSchema *stagedTableSchema,
 	snapshotProps iceberggo.Properties,
 ) error {
 	if len(rows) == 0 {
@@ -64,7 +65,7 @@ func (a *icebergAppender) AppendRows(
 
 	ownerID := snapshotProps[snapshotOwnerIDKey]
 	changefeed := snapshotProps[snapshotChangefeedKey]
-	tbl, err := a.loadOrCreateTable(ctx, identifier, rows, ownerID, changefeed,
+	tbl, err := a.loadOrCreateTable(ctx, identifier, rows, tableSchema, ownerID, changefeed,
 		snapshotProps[snapshotCDCClusterIDKey], snapshotProps[snapshotUpstreamIDKey])
 	if err != nil {
 		return errors.Trace(err)
@@ -135,6 +136,7 @@ func (a *icebergAppender) loadOrCreateTable(
 	ctx context.Context,
 	identifier []string,
 	rows []map[string]any,
+	tableSchema *stagedTableSchema,
 	ownerID string,
 	changefeed string,
 	cdcClusterID string,
@@ -157,7 +159,7 @@ func (a *icebergAppender) loadOrCreateTable(
 		if !stderrors.Is(err, catalog.ErrNoSuchTable) {
 			return nil, fmt.Errorf("load iceberg table %q: %w", identifier, err)
 		}
-		loaded, err = a.createTable(ctx, identifier, rows, ownerID, changefeed, cdcClusterID, upstreamID)
+		loaded, err = a.createTable(ctx, identifier, rows, tableSchema, ownerID, changefeed, cdcClusterID, upstreamID)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -175,6 +177,7 @@ func (a *icebergAppender) createTable(
 	ctx context.Context,
 	identifier []string,
 	rows []map[string]any,
+	tableSchema *stagedTableSchema,
 	ownerID string,
 	changefeed string,
 	cdcClusterID string,
@@ -186,7 +189,15 @@ func (a *icebergAppender) createTable(
 		return nil, errors.Trace(err)
 	}
 
-	schema, err := icebergtable.ArrowSchemaToIcebergWithFreshIDs(arrowSchemaForRows(rows), false)
+	arrowSchema := arrowSchemaForRows(rows)
+	if tableSchema != nil {
+		arrowSchema = arrowSchemaForStagedTableSchema(tableSchema)
+	}
+	schema, err := icebergtable.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, false)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	partitionSpec, err := cdcLogPartitionSpec(schema)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -208,7 +219,9 @@ func (a *icebergAppender) createTable(
 		props[tableUpstreamIDKey] = upstreamID
 	}
 
-	tbl, err := a.catalog.CreateTable(ctx, ident, schema, catalog.WithProperties(props))
+	tbl, err := a.catalog.CreateTable(ctx, ident, schema,
+		catalog.WithPartitionSpec(partitionSpec),
+		catalog.WithProperties(props))
 	if err != nil {
 		if stderrors.Is(err, catalog.ErrTableAlreadyExists) {
 			loaded, err := a.catalog.LoadTable(ctx, ident)

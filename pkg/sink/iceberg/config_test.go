@@ -69,6 +69,15 @@ func TestParseConfigAllowsRemoteWarehouseWithExplicitStagingDir(t *testing.T) {
 	require.Equal(t, "/mnt/shared/ticdc-stage", cfg.StagingDir)
 }
 
+func TestParseConfigRejectsUnsupportedRemoteWarehouseScheme(t *testing.T) {
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=gs://bucket/warehouse&staging-dir=file:///mnt/shared/ticdc-stage")
+	require.NoError(t, err)
+
+	_, err = ParseConfig(uri)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported iceberg warehouse scheme")
+}
+
 func TestTargetIdentifier(t *testing.T) {
 	cfg := Config{
 		DatabasePrefix: "tidb_",
