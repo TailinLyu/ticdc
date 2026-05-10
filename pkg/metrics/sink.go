@@ -175,6 +175,30 @@ var (
 			Help:      "Total count of durable committed-batch ledger lookup attempts.",
 		}, []string{getKeyspaceLabel(), "changefeed", "result"})
 
+	IcebergCommittedRowLedgerEntriesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_row_ledger_entries",
+			Help:      "Number of durable committed row-ID ledger entries written by this TiCDC process for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
+	IcebergCommittedRowLedgerWritesCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_row_ledger_writes_total",
+			Help:      "Total count of durable committed row-ID ledger write attempts.",
+		}, []string{getKeyspaceLabel(), "changefeed", "result"})
+
+	IcebergCommittedRowLedgerLookupsCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_row_ledger_lookups_total",
+			Help:      "Total count of durable committed row-ID ledger lookup attempts.",
+		}, []string{getKeyspaceLabel(), "changefeed", "result"})
+
 	IcebergAppendFailureCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "ticdc",
@@ -370,6 +394,9 @@ func initSinkMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(IcebergCommittedLedgerEntriesGauge)
 	registry.MustRegister(IcebergCommittedLedgerWritesCounter)
 	registry.MustRegister(IcebergCommittedLedgerLookupsCounter)
+	registry.MustRegister(IcebergCommittedRowLedgerEntriesGauge)
+	registry.MustRegister(IcebergCommittedRowLedgerWritesCounter)
+	registry.MustRegister(IcebergCommittedRowLedgerLookupsCounter)
 	registry.MustRegister(IcebergAppendFailureCounter)
 	registry.MustRegister(IcebergCleanupFailureCounter)
 	registry.MustRegister(IcebergStagingBackendInfoGauge)

@@ -409,6 +409,8 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 	prepared := make([]preparedStagedFile, 0, len(eligible))
 	candidateBatchIDsByIdentifier := make(map[string][]string)
 	candidateBatchIDSeenByIdentifier := make(map[string]map[string]struct{})
+	candidateRowIDsByIdentifier := make(map[string][]string)
+	candidateRowIDSeenByIdentifier := make(map[string]map[string]struct{})
 	identifierByKey := make(map[string][]string)
 	for _, staged := range eligible {
 		rowIDs, err := stagedRowIDs(staged.batch.Identifier, staged.batch.Rows, staged.batch.RowIDs)
@@ -437,6 +439,18 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			candidateBatchIDsByIdentifier[key] = append(candidateBatchIDsByIdentifier[key], staged.batch.BatchID)
 			seenBatchIDs[staged.batch.BatchID] = struct{}{}
 		}
+		seenRowIDs := candidateRowIDSeenByIdentifier[key]
+		if seenRowIDs == nil {
+			seenRowIDs = make(map[string]struct{})
+			candidateRowIDSeenByIdentifier[key] = seenRowIDs
+		}
+		for _, rowID := range rowIDs {
+			if _, ok := seenRowIDs[rowID]; ok {
+				continue
+			}
+			candidateRowIDsByIdentifier[key] = append(candidateRowIDsByIdentifier[key], rowID)
+			seenRowIDs[rowID] = struct{}{}
+		}
 	}
 
 	committedByIdentifier := make(map[string]map[string]struct{}, len(candidateBatchIDsByIdentifier))
@@ -453,6 +467,20 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		}
 		committedByIdentifier[key] = committedBatches
 	}
+	committedRowIDsByIdentifier := make(map[string]map[string]struct{}, len(candidateRowIDsByIdentifier))
+	for key, rowIDs := range candidateRowIDsByIdentifier {
+		committedRowIDs, err := s.durableCommittedRowIDs(ctx, identifierByKey[key], rowIDs)
+		if err != nil {
+			s.recordAppendFailure("committed_row_lookup")
+			log.Warn("iceberg committer will retry after committed row lookup failure",
+				zap.String("changefeed", s.changefeedID.String()),
+				zap.Strings("identifier", identifierByKey[key]),
+				zap.Error(err))
+			s.resetWriter()
+			return nil
+		}
+		committedRowIDsByIdentifier[key] = committedRowIDs
+	}
 
 	currentGroups := make(map[string]*stagedDrainGroup)
 	rowIDsByIdentifier := make(map[string]map[string]struct{})
@@ -464,16 +492,20 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		key := identifierKey(staged.batch.Identifier)
 		seenRowIDs := rowIDsByIdentifier[key]
 		if seenRowIDs == nil {
-			seenRowIDs = s.committedRowIDs(key)
+			seenRowIDs = s.cachedCommittedRowIDs(key)
 			if seenRowIDs == nil {
 				seenRowIDs = make(map[string]struct{}, len(staged.batch.Rows))
 			}
+			rememberRowIDSet(seenRowIDs, committedRowIDsByIdentifier[key])
 			rowIDsByIdentifier[key] = seenRowIDs
 		}
 		if _, committed := committedByIdentifier[key][staged.batch.BatchID]; committed {
 			rememberRowIDs(seenRowIDs, rowIDs)
 			s.rememberCommittedRowIDs(key, rowIDs)
 			if err := s.markBatchesCommitted(ctx, staged.batch.Identifier, []string{staged.batch.BatchID}, staged.batch.MaxCommitTs, len(staged.batch.Rows)); err != nil {
+				return errors.Trace(err)
+			}
+			if err := s.markRowsCommitted(ctx, staged.batch.Identifier, rowIDs, []string{staged.batch.BatchID}, staged.batch.MaxCommitTs); err != nil {
 				return errors.Trace(err)
 			}
 			deleteQueued := stagedBatchSafeToDelete(staged.batch, checkpointTs, latestStagedCommitTs[key])
@@ -565,6 +597,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 				if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, len(group.rows)); err != nil {
 					return errors.Trace(err)
 				}
+				if err := s.markRowsCommitted(ctx, group.identifier, group.rowIDs, group.batchIDs, group.maxCommitTs); err != nil {
+					return errors.Trace(err)
+				}
 				s.rememberCommittedRowIDs(identifierKey(group.identifier), group.rowIDs)
 				groupKey := identifierKey(group.identifier)
 				if stagedGroupSafeToDelete(group, checkpointTs, latestStagedCommitTs[groupKey]) {
@@ -585,6 +620,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			return nil
 		}
 		if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, len(group.rows)); err != nil {
+			return errors.Trace(err)
+		}
+		if err := s.markRowsCommitted(ctx, group.identifier, group.rowIDs, group.batchIDs, group.maxCommitTs); err != nil {
 			return errors.Trace(err)
 		}
 		s.rememberCommittedRowIDs(identifierKey(group.identifier), group.rowIDs)
@@ -661,6 +699,20 @@ func (s *sink) committedBatches(
 	return committedBatches, nil
 }
 
+func (s *sink) durableCommittedRowIDs(
+	ctx context.Context,
+	identifier []string,
+	rowIDs []string,
+) (map[string]struct{}, error) {
+	committedRowIDs, err := s.stage.CommittedRowIDsForCandidates(ctx, s.changefeedID.String(), identifier, rowIDs)
+	if err != nil {
+		s.recordCommittedRowLedgerLookup("error")
+		return nil, errors.Trace(err)
+	}
+	s.recordCommittedRowLedgerLookup("success")
+	return committedRowIDs, nil
+}
+
 func (s *sink) markBatchesCommitted(
 	ctx context.Context,
 	identifier []string,
@@ -676,6 +728,26 @@ func (s *sink) markBatchesCommitted(
 	s.recordCommittedLedgerWrite("success")
 	if created > 0 {
 		metrics.IcebergCommittedLedgerEntriesGauge.WithLabelValues(
+			s.changefeedID.Keyspace(), s.changefeedID.Name()).Add(float64(created))
+	}
+	return nil
+}
+
+func (s *sink) markRowsCommitted(
+	ctx context.Context,
+	identifier []string,
+	rowIDs []string,
+	batchIDs []string,
+	maxCommitTs uint64,
+) error {
+	created, err := s.stage.MarkRowsCommitted(ctx, s.changefeedID.String(), identifier, rowIDs, batchIDs, maxCommitTs)
+	if err != nil {
+		s.recordCommittedRowLedgerWrite("error")
+		return errors.Trace(err)
+	}
+	s.recordCommittedRowLedgerWrite("success")
+	if created > 0 {
+		metrics.IcebergCommittedRowLedgerEntriesGauge.WithLabelValues(
 			s.changefeedID.Keyspace(), s.changefeedID.Name()).Add(float64(created))
 	}
 	return nil
@@ -786,6 +858,16 @@ func (s *sink) recordCommittedLedgerLookup(result string) {
 		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Inc()
 }
 
+func (s *sink) recordCommittedRowLedgerWrite(result string) {
+	metrics.IcebergCommittedRowLedgerWritesCounter.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Inc()
+}
+
+func (s *sink) recordCommittedRowLedgerLookup(result string) {
+	metrics.IcebergCommittedRowLedgerLookupsCounter.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Inc()
+}
+
 func appendFailureReason(err error) string {
 	if errors.Is(err, errIcebergTargetOwnerConflict) || errors.Cause(err) == errIcebergTargetOwnerConflict {
 		return "owner_conflict"
@@ -815,6 +897,7 @@ func (s *sink) closeStageMetrics() {
 	metrics.IcebergStagedBytesGauge.DeleteLabelValues(keyspace, changefeed, "eligible")
 	metrics.IcebergCommitBarrierLagGauge.DeleteLabelValues(keyspace, changefeed)
 	metrics.IcebergCommittedLedgerEntriesGauge.DeleteLabelValues(keyspace, changefeed)
+	metrics.IcebergCommittedRowLedgerEntriesGauge.DeleteLabelValues(keyspace, changefeed)
 	metrics.IcebergStagingBackendInfoGauge.DeleteLabelValues(keyspace, changefeed, "local_json")
 }
 
@@ -919,7 +1002,13 @@ func rememberRowIDs(seenRowIDs map[string]struct{}, rowIDs []string) {
 	}
 }
 
-func (s *sink) committedRowIDs(key string) map[string]struct{} {
+func rememberRowIDSet(seenRowIDs map[string]struct{}, rowIDs map[string]struct{}) {
+	for rowID := range rowIDs {
+		seenRowIDs[rowID] = struct{}{}
+	}
+}
+
+func (s *sink) cachedCommittedRowIDs(key string) map[string]struct{} {
 	cache := s.committedRowIDsByIdentifier[key]
 	if cache == nil || len(cache.set) == 0 {
 		return nil

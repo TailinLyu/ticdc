@@ -211,17 +211,18 @@ Remaining intentional limitations:
   every TiCDC capture must see the same `staging-dir` path, typically through a
   shared filesystem or PVC. A staged JSON batch is made visible only after temp
   write, file fsync, close, atomic rename, and parent directory fsync.
-- Replay dedupe now uses both Iceberg snapshot summaries and a durable committed
-  ledger under `.committed` in the shared staging directory. Operators must retain
+- Replay dedupe now uses Iceberg snapshot summaries, a durable committed-batch
+  ledger under `.committed`, and a durable committed row-ID ledger under
+  `.committed-rows` in the shared staging directory. Operators must retain
   staged files and committed ledger markers for at least the maximum replay
-  horizon. Ledger lookup is direct by candidate marker path, and Iceberg
-  snapshot-summary dedupe scans newest-first and stops once the current staged
-  batch candidates are found. Partial-overlap replay is restart-safe because
-  staged-file cleanup is deferred until the end of a drain, and committed staged
-  evidence is retained while the same target still has later staged files
-  waiting; duplicate-only replay batches are marked handled before cleanup, and
-  the bounded row-ID cache is only an in-process optimization. Native Iceberg
-  data-file committables remain the target production design.
+  horizon. Ledger lookups are direct by current candidate marker path, and
+  Iceberg snapshot-summary dedupe scans newest-first and stops once the current
+  staged batch candidates are found. Partial-overlap replay is restart-safe even
+  when the overlapping replay batch is staged after the earlier stage file has
+  already been cleaned up; duplicate-only replay batches are marked handled
+  before cleanup, and the bounded row-ID cache is only an in-process
+  optimization. Native Iceberg data-file committables remain the target
+  production design.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
   `run_s17_schema_unsupported.sh` and
   `run_s17_create_table_unsupported.sh` verify that live DDL is rejected
@@ -256,6 +257,9 @@ ticdc_sink_iceberg_committed_rows_total
 ticdc_sink_iceberg_committed_ledger_entries
 ticdc_sink_iceberg_committed_ledger_writes_total
 ticdc_sink_iceberg_committed_ledger_lookups_total
+ticdc_sink_iceberg_committed_row_ledger_entries
+ticdc_sink_iceberg_committed_row_ledger_writes_total
+ticdc_sink_iceberg_committed_row_ledger_lookups_total
 ticdc_sink_iceberg_staging_backend_info
 ticdc_sink_iceberg_commit_barrier_lag_tso
 ticdc_sink_iceberg_append_failures_total
@@ -268,14 +272,17 @@ Minimum local alert guardrails for the current v1 contract:
 ```bash
 increase(ticdc_sink_iceberg_committed_ledger_writes_total{result="error"}[5m]) > 0
 increase(ticdc_sink_iceberg_committed_ledger_lookups_total{result="error"}[5m]) > 0
+increase(ticdc_sink_iceberg_committed_row_ledger_writes_total{result="error"}[5m]) > 0
+increase(ticdc_sink_iceberg_committed_row_ledger_lookups_total{result="error"}[5m]) > 0
 ticdc_sink_iceberg_staged_oldest_age_seconds{state="pending"} > <max_expected_drain_seconds>
 ticdc_sink_iceberg_staged_bytes{state="pending"} > <max_expected_backlog_bytes>
 ```
 
 The retention runbook must keep Iceberg snapshots, staged JSON files, and
-`.committed` ledger markers for at least the maximum TiCDC replay horizon. If
-ledger writes fail after Iceberg append, retained snapshots are still the
-fallback until the ledger marker is written on retry.
+`.committed`/`.committed-rows` ledger markers for at least the maximum TiCDC
+replay horizon. If ledger writes fail after Iceberg append, retained snapshots
+and staged files are still the fallback until the ledger markers are written on
+retry.
 
 The fresh replay/hardening scripts can be rerun with:
 

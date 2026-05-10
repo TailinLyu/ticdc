@@ -31,38 +31,42 @@ matrix.
   is written to a temp file, fsynced, closed, atomically renamed, and then the
   containing target staging directory is fsynced before the writer can
   `PostFlush` upstream progress.
-- The committer deduplicates replay through two sources: Iceberg snapshot
-  summaries and a durable committed-batch ledger under
-  `<staging-dir>/<base64(changefeed)>/.committed/<base64(target)>/*.commit`.
-  The ledger is written and synced before staged files are deleted, and snapshot
-  summary hits backfill missing ledger entries.
-- The replay hot path does not scan every retained batch marker into memory. It
-  looks up only the candidate staged batch IDs currently being drained; Iceberg
-  snapshot summaries are scanned from newest to oldest until those candidates
-  are found, and local ledger lookup is direct by candidate marker path. The
-  `ticdc_sink_iceberg_committed_ledger_entries` gauge is updated incrementally
-  for markers written by the running TiCDC process instead of walking the ledger
-  tree on every metrics refresh.
-- The ledger removes snapshot-expiration-only replay risk when the shared staging
-  directory is retained. The remaining runbook guard is: do not purge staged
-  files or `.committed` ledger markers before the maximum replay horizon, and do
-  not expire all relevant Iceberg snapshots while retained staged files may still
-  predate the ledger write after an append crash.
+- The committer deduplicates replay through Iceberg snapshot summaries, a
+  durable committed-batch ledger under
+  `<staging-dir>/<base64(changefeed)>/.committed/<base64(target)>/*.commit`,
+  and a durable row-ID ledger under `.committed-rows`. Batch and row markers are
+  written and synced before staged files are deleted, and snapshot summary hits
+  backfill missing local markers.
+- The replay hot path does not scan retained marker trees into memory. It looks
+  up only the candidate staged batch IDs and row IDs currently being drained;
+  Iceberg snapshot summaries are scanned from newest to oldest until those batch
+  candidates are found, and local ledger lookup is direct by candidate marker
+  path. The batch and row ledger entry gauges are updated incrementally for
+  markers written by the running TiCDC process instead of walking the ledger
+  trees on every metrics refresh.
+- The ledgers remove snapshot-expiration-only replay risk and delayed
+  partial-overlap replay risk when the shared staging directory is retained. The
+  remaining runbook guard is: do not purge staged files, `.committed`, or
+  `.committed-rows` markers before the maximum replay horizon, and do not expire
+  all relevant Iceberg snapshots while retained staged files may still predate
+  the ledger write after an append crash.
 - The sink exposes Iceberg operator metrics for staged files/rows/bytes, oldest
   staged age, commit latency/result, committed batch and row counts, durable
-  ledger entries/writes/lookups, staging backend, commit-barrier lag, append
-  failures, cleanup failures, and target-owner conflicts.
+  batch and row ledger entries/writes/lookups, staging backend,
+  commit-barrier lag, append failures, cleanup failures, and target-owner
+  conflicts.
 - Replayed DML row IDs are stable across processor restart splits when TiCDC
   does not populate raw `RowKey`: the sink falls back to the table primary/handle
   key and only uses row index for tables without a usable logical key.
-- Partial-overlap replay dedupe is restart-safe because staged-file cleanup is
-  deferred until the end of a drain and committed staged evidence is retained
-  while the same target still has later staged files waiting. Duplicate-only
-  replay batches are durably marked handled before cleanup, so a partial delete
-  cannot turn a retained no-op batch into a future append. A bounded per-target
-  row-ID cache remains as an in-process optimization, not the correctness
-  boundary. The durable long-term answer remains Iceberg-native committables
-  with a target-level commit protocol.
+- Partial-overlap replay dedupe is restart-safe even when the later overlapping
+  batch is staged after the earlier stage file has already been cleaned up,
+  because committed row IDs are kept in the durable row ledger. Staged-file
+  cleanup is still deferred until the end of a drain, committed staged evidence
+  is retained while the same target has later staged files waiting, and
+  duplicate-only replay batches are durably marked handled before cleanup. A
+  bounded per-target row-ID cache remains as an in-process optimization, not the
+  correctness boundary. The durable long-term answer remains Iceberg-native
+  committables with a target-level commit protocol.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are explicitly
   unsupported for now. Bootstrap/not-sync create DDL remains allowed. Unsupported
   live DDL fails the changefeed instead of silently producing partial semantics.
@@ -76,22 +80,22 @@ matrix.
 - Focused unit and helper packages:
   - `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1`
   - Focused durable-ledger/metrics regression tests cover snapshot-history
-    expiration dedupe, ledger-before-delete ordering, staged byte/backend
-    metrics, committed row metrics, and ledger write/lookup metrics.
+    expiration dedupe, delayed partial-overlap replay after cleanup,
+    ledger-before-delete ordering, staged byte/backend metrics, committed row
+    metrics, and batch/row ledger write/lookup metrics.
   - Focused review regressions cover staged-file fsync plus parent-directory
     fsync before return, candidate-bounded snapshot-summary dedupe, and
     restart-safe partial-overlap replay dedupe.
 - Replay/crash reruns:
-  - `S03_REPLAY_PASS cf=s03-replay-1778399480 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
-  - `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S03_REPLAY_PASS cf=s03-replay-1778401106 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S05_REPLAY_PASS cf=s05-replay-1778401067 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
   - `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0`
-- Metrics scrape after S05 showed `ticdc_sink_iceberg_commit_duration_seconds`,
+- Earlier metrics scrape after S05 showed `ticdc_sink_iceberg_commit_duration_seconds`,
   `ticdc_sink_iceberg_committed_batches_total`,
   `ticdc_sink_iceberg_committed_rows_total`,
   `ticdc_sink_iceberg_committed_ledger_lookups_total`, and
-  `ticdc_sink_iceberg_committed_ledger_writes_total` for
-  `s05-replay-1778393687`.
+  `ticdc_sink_iceberg_committed_ledger_writes_total`.
 - Catalog and drain reruns:
   - `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0`
   - `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0`
@@ -129,9 +133,12 @@ matrix.
   The minimum alerts for this PR are non-zero
   `ticdc_sink_iceberg_committed_ledger_writes_total{result="error"}`,
   non-zero `ticdc_sink_iceberg_committed_ledger_lookups_total{result="error"}`,
+  non-zero `ticdc_sink_iceberg_committed_row_ledger_writes_total{result="error"}`,
+  non-zero `ticdc_sink_iceberg_committed_row_ledger_lookups_total{result="error"}`,
   stale or growing staged backlog age/bytes, and retention-policy drift where
-  Iceberg snapshots, staged JSON files, or `.committed` markers are purged before
-  the maximum replay horizon. Still missing explicit catalog retry counters and
+  Iceberg snapshots, staged JSON files, `.committed`, or `.committed-rows`
+  markers are purged before the maximum replay horizon. Still missing explicit
+  catalog retry counters and
   table-creation/schema-failure counters.
 - Extend MinIO/S3-style integration coverage beyond the owner marker to include
   credential/auth failure modes, remote orphan cleanup, and eventually

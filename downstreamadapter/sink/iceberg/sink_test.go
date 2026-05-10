@@ -664,6 +664,59 @@ func TestCommitterDeduplicatesRowsCommittedInPriorDrain(t *testing.T) {
 	require.Zero(t, stageFileCount(t, cfg.StagingDir))
 }
 
+func TestCommitterDeduplicatesDelayedReplayAfterCleanup(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(10),
+			"_table_id":       int64(101),
+			stagingRowIDField: "stable-replay-row",
+			"data":            map[string]any{"id": int64(1)},
+		},
+	}, 10))
+
+	s := newSink(ctx, changefeedID, cfg, writer)
+	s.SetTableSchemaStore(nil)
+	require.NoError(t, s.drainStaged(ctx, 10))
+	require.Len(t, writer.getCalls(), 1)
+	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(20),
+			"_table_id":       int64(101),
+			stagingRowIDField: "stable-replay-row",
+			"data":            map[string]any{"id": int64(1)},
+		},
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(20),
+			"_table_id":       int64(101),
+			stagingRowIDField: "new-row",
+			"data":            map[string]any{"id": int64(2)},
+		},
+	}, 20))
+
+	restarted := newSink(ctx, changefeedID, cfg, writer)
+	restarted.SetTableSchemaStore(nil)
+	require.NoError(t, restarted.drainStaged(ctx, 20))
+	calls := writer.getCalls()
+	require.Len(t, calls, 2)
+	require.Len(t, calls[1].rows, 1)
+	data := calls[1].rows[0]["data"].(map[string]any)
+	require.Equal(t, "2", data["id"].(json.Number).String())
+	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+}
+
 func TestCommitterPreservesDistinctRowsWithSamePayload(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -919,6 +972,9 @@ func TestStageListSkipsCommittedLedgerSubtree(t *testing.T) {
 		filepath.Join(committedBatchLedgerDir(cfg.StagingDir, changefeedID.String(), identifier), "not-a-stage-file.json"),
 		[]byte("{"),
 		0o644))
+	rowLedgerPath := committedRowLedgerPath(cfg.StagingDir, changefeedID.String(), identifier, "row-a")
+	require.NoError(t, os.MkdirAll(filepath.Dir(rowLedgerPath), 0o755))
+	require.NoError(t, os.WriteFile(rowLedgerPath[:len(rowLedgerPath)-len(".row")]+".json", []byte("{"), 0o644))
 
 	files, err := stage.List(ctx, changefeedID.String())
 	require.NoError(t, err)
@@ -990,6 +1046,30 @@ func TestStageCommittedBatchesUsesCandidateLookup(t *testing.T) {
 	ledger, err := stage.CommittedBatchesForCandidates(ctx, changefeedID.String(), identifier, []string{"batch-a", "missing"})
 	require.NoError(t, err)
 	require.Contains(t, ledger, "batch-a")
+	require.NotContains(t, ledger, "missing")
+}
+
+func TestStageCommittedRowIDsUsesCandidateLookup(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+
+	created, err := stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, []string{"row-a", "row-b", "row-a"}, []string{"batch-a"}, 10)
+	require.NoError(t, err)
+	require.Equal(t, 2, created)
+	created, err = stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, []string{"row-a"}, []string{"batch-a"}, 10)
+	require.NoError(t, err)
+	require.Zero(t, created)
+	corruptPath := committedRowLedgerPath(cfg.StagingDir, changefeedID.String(), identifier, "row-c")
+	require.NoError(t, os.MkdirAll(filepath.Dir(corruptPath), 0o755))
+	require.NoError(t, os.WriteFile(corruptPath, []byte("{"), 0o644))
+
+	ledger, err := stage.CommittedRowIDsForCandidates(ctx, changefeedID.String(), identifier, []string{"row-a", "missing"})
+	require.NoError(t, err)
+	require.Contains(t, ledger, "row-a")
 	require.NotContains(t, ledger, "missing")
 }
 

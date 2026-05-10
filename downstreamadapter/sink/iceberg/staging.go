@@ -62,6 +62,15 @@ type committedBatchRecord struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type committedRowRecord struct {
+	Changefeed  string    `json:"changefeed"`
+	RowID       string    `json:"row_id"`
+	Identifier  []string  `json:"identifier"`
+	BatchIDs    []string  `json:"batch_ids"`
+	MaxCommitTs uint64    `json:"max_commit_ts"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type stageStore struct {
 	root string
 }
@@ -161,7 +170,7 @@ func (s *stageStore) List(ctx context.Context, changefeed string) ([]stagedFile,
 			}
 			return err
 		}
-		if d != nil && d.IsDir() && d.Name() == ".committed" {
+		if d != nil && d.IsDir() && (d.Name() == ".committed" || d.Name() == ".committed-rows") {
 			return filepath.SkipDir
 		}
 		if d == nil || d.IsDir() || filepath.Ext(path) != ".json" {
@@ -296,6 +305,122 @@ func (s *stageStore) CommittedBatchesForCandidates(
 	return committed, nil
 }
 
+func (s *stageStore) MarkRowsCommitted(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	rowIDs []string,
+	batchIDs []string,
+	maxCommitTs uint64,
+) (int, error) {
+	if len(rowIDs) == 0 {
+		return 0, nil
+	}
+	if s.root == "" {
+		return 0, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return 0, errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return 0, errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	created := 0
+	seen := make(map[string]struct{}, len(rowIDs))
+	for _, rowID := range rowIDs {
+		if rowID == "" {
+			return 0, errors.New("iceberg committed row id is empty")
+		}
+		if _, ok := seen[rowID]; ok {
+			continue
+		}
+		seen[rowID] = struct{}{}
+		if err := ctx.Err(); err != nil {
+			return 0, errors.Trace(err)
+		}
+
+		finalName := committedRowLedgerPath(s.root, changefeed, identifier, rowID)
+		dir := filepath.Dir(finalName)
+		if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
+			return 0, errors.Trace(err)
+		}
+		if _, err := os.Stat(finalName); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return 0, errors.Trace(err)
+		}
+
+		record := committedRowRecord{
+			Changefeed:  changefeed,
+			RowID:       rowID,
+			Identifier:  append([]string(nil), identifier...),
+			BatchIDs:    append([]string(nil), batchIDs...),
+			MaxCommitTs: maxCommitTs,
+			CreatedAt:   time.Now().UTC(),
+		}
+		if err := writeCommittedRowRecord(dir, finalName, record); err != nil {
+			return 0, errors.Trace(err)
+		}
+		created++
+	}
+	return created, nil
+}
+
+func (s *stageStore) CommittedRowIDsForCandidates(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	rowIDs []string,
+) (map[string]struct{}, error) {
+	if s.root == "" {
+		return nil, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return nil, errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return nil, errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	committed := make(map[string]struct{}, len(rowIDs))
+	seen := make(map[string]struct{}, len(rowIDs))
+	for _, rowID := range rowIDs {
+		if rowID == "" {
+			return nil, errors.New("iceberg committed row id is empty")
+		}
+		if _, ok := seen[rowID]; ok {
+			continue
+		}
+		seen[rowID] = struct{}{}
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Trace(err)
+		}
+		path := committedRowLedgerPath(s.root, changefeed, identifier, rowID)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, errors.Trace(err)
+		}
+		record, err := readCommittedRowRecord(path)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if record.RowID != rowID {
+			return nil, errors.Errorf("iceberg committed row id mismatch: path=%s record=%s", rowID, record.RowID)
+		}
+		committed[rowID] = struct{}{}
+	}
+	return committed, nil
+}
+
 func (s *stageStore) Delete(path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return errors.Trace(err)
@@ -425,8 +550,30 @@ func readCommittedBatchRecord(path string) (committedBatchRecord, error) {
 	return record, nil
 }
 
+func readCommittedRowRecord(path string) (committedRowRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return committedRowRecord{}, errors.Trace(err)
+	}
+	defer file.Close()
+
+	var record committedRowRecord
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&record); err != nil {
+		return committedRowRecord{}, errors.Trace(err)
+	}
+	if record.RowID == "" {
+		return committedRowRecord{}, errors.New("iceberg committed row id is empty")
+	}
+	return record, nil
+}
+
 func writeCommittedBatchRecord(dir string, finalName string, record committedBatchRecord) error {
 	return writeJSONFileAtomically(dir, ".ledger-*.tmp", finalName, &record)
+}
+
+func writeCommittedRowRecord(dir string, finalName string, record committedRowRecord) error {
+	return writeJSONFileAtomically(dir, ".row-ledger-*.tmp", finalName, &record)
 }
 
 func writeJSONFileAtomically(dir string, tmpPattern string, finalName string, value any) error {
@@ -595,6 +742,16 @@ func committedBatchLedgerDir(root string, changefeed string, identifier []string
 
 func committedBatchLedgerPath(root string, changefeed string, identifier []string, batchID string) string {
 	return filepath.Join(committedBatchLedgerDir(root, changefeed, identifier), batchID+".commit")
+}
+
+func committedRowLedgerDir(root string, changefeed string, identifier []string) string {
+	return filepath.Join(root, pathSegment(changefeed), ".committed-rows", pathSegment(identifierKey(identifier)))
+}
+
+func committedRowLedgerPath(root string, changefeed string, identifier []string, rowID string) string {
+	sum := sha256.Sum256([]byte(rowID))
+	encoded := hex.EncodeToString(sum[:])
+	return filepath.Join(committedRowLedgerDir(root, changefeed, identifier), encoded[:2], encoded+".row")
 }
 
 func stagedBatchID(identifier []string, rows []map[string]any, rowIDs []string, maxCommitTs uint64) (string, error) {
