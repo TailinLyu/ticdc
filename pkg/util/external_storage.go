@@ -45,11 +45,11 @@ func GetExternalStorageWithDefaultTimeout(ctx context.Context, uri string) (stor
 	// total retry time is [1<<7, 1<<8] = [128, 256] + 30*6 = [308, 436] seconds
 	r := NewS3Retryer(7, 1*time.Second, 2*time.Second)
 	s, err := getExternalStorage(ctx, uri, nil, r)
+	if err != nil {
+		return nil, err
+	}
 
-	return &extStorageWithTimeout{
-		ExternalStorage: s,
-		timeout:         defaultTimeout,
-	}, err
+	return wrapExternalStorageWithTimeout(s, defaultTimeout), nil
 }
 
 // getExternalStorage creates a new storage.ExternalStorage based on the uri and options.
@@ -156,6 +156,23 @@ func NewS3Retryer(maxRetries int, minRetryDelay, minThrottleDelay time.Duration)
 type extStorageWithTimeout struct {
 	storage.ExternalStorage
 	timeout time.Duration
+}
+
+type strongExtStorageWithTimeout struct {
+	*extStorageWithTimeout
+}
+
+func (*strongExtStorageWithTimeout) MarkStrongConsistency() {}
+
+func wrapExternalStorageWithTimeout(s storage.ExternalStorage, timeout time.Duration) storage.ExternalStorage {
+	wrapped := &extStorageWithTimeout{
+		ExternalStorage: s,
+		timeout:         timeout,
+	}
+	if _, ok := s.(storage.StrongConsistency); ok {
+		return &strongExtStorageWithTimeout{extStorageWithTimeout: wrapped}
+	}
+	return wrapped
 }
 
 // WriteFile writes a complete file to storage, similar to os.WriteFile,

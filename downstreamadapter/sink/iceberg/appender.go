@@ -36,6 +36,11 @@ type icebergAppender struct {
 	tables map[string]*icebergtable.Table
 }
 
+type namespaceEnsurer interface {
+	CreateNamespace(context.Context, icebergtable.Identifier, iceberggo.Properties) error
+	CheckNamespaceExists(context.Context, icebergtable.Identifier) (bool, error)
+}
+
 func newIcebergAppender(ctx context.Context, cfg *icebergcfg.Config) (*icebergAppender, error) {
 	cat, err := rest.NewCatalog(ctx, "ticdc", cfg.CatalogURI, rest.WithWarehouseLocation(cfg.Warehouse))
 	if err != nil {
@@ -57,7 +62,10 @@ func (a *icebergAppender) AppendRows(
 		return nil
 	}
 
-	tbl, err := a.loadOrCreateTable(ctx, identifier, rows)
+	ownerID := snapshotProps[snapshotOwnerIDKey]
+	changefeed := snapshotProps[snapshotChangefeedKey]
+	tbl, err := a.loadOrCreateTable(ctx, identifier, rows, ownerID, changefeed,
+		snapshotProps[snapshotCDCClusterIDKey], snapshotProps[snapshotUpstreamIDKey])
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -90,10 +98,47 @@ func (a *icebergAppender) AppendRows(
 	return nil
 }
 
+func (a *icebergAppender) CommittedBatches(
+	ctx context.Context,
+	identifier []string,
+) (map[string]struct{}, error) {
+	tbl, err := a.catalog.LoadTable(ctx, icebergtable.Identifier(identifier))
+	if err != nil {
+		if stderrors.Is(err, catalog.ErrNoSuchTable) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load iceberg table %q: %w", identifier, err)
+	}
+
+	a.mu.Lock()
+	a.tables[identifierKey(identifier)] = tbl
+	a.mu.Unlock()
+	return tableCommittedBatches(tbl), nil
+}
+
+func tableCommittedBatches(tbl *icebergtable.Table) map[string]struct{} {
+	committedBatches := make(map[string]struct{})
+	for _, snapshot := range tbl.Metadata().Snapshots() {
+		if snapshot.Summary == nil {
+			continue
+		}
+		for _, committed := range batchIDsFromProps(snapshot.Summary.Properties) {
+			if committed != "" {
+				committedBatches[committed] = struct{}{}
+			}
+		}
+	}
+	return committedBatches
+}
+
 func (a *icebergAppender) loadOrCreateTable(
 	ctx context.Context,
 	identifier []string,
 	rows []map[string]any,
+	ownerID string,
+	changefeed string,
+	cdcClusterID string,
+	upstreamID string,
 ) (*icebergtable.Table, error) {
 	key := identifierKey(identifier)
 
@@ -101,6 +146,9 @@ func (a *icebergAppender) loadOrCreateTable(
 	tbl := a.tables[key]
 	a.mu.Unlock()
 	if tbl != nil {
+		if err := validateTargetOwner(tbl, ownerID, changefeed); err != nil {
+			return nil, errors.Trace(err)
+		}
 		return tbl, nil
 	}
 
@@ -109,10 +157,12 @@ func (a *icebergAppender) loadOrCreateTable(
 		if !stderrors.Is(err, catalog.ErrNoSuchTable) {
 			return nil, fmt.Errorf("load iceberg table %q: %w", identifier, err)
 		}
-		loaded, err = a.createTable(ctx, identifier, rows)
+		loaded, err = a.createTable(ctx, identifier, rows, ownerID, changefeed, cdcClusterID, upstreamID)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+	} else if err := validateTargetOwner(loaded, ownerID, changefeed); err != nil {
+		return nil, errors.Trace(err)
 	}
 
 	a.mu.Lock()
@@ -125,14 +175,15 @@ func (a *icebergAppender) createTable(
 	ctx context.Context,
 	identifier []string,
 	rows []map[string]any,
+	ownerID string,
+	changefeed string,
+	cdcClusterID string,
+	upstreamID string,
 ) (*icebergtable.Table, error) {
 	ident := icebergtable.Identifier(identifier)
 	namespace := catalog.NamespaceFromIdent(ident)
-	if len(namespace) != 0 {
-		err := a.catalog.CreateNamespace(ctx, namespace, iceberggo.Properties{})
-		if err != nil && !stderrors.Is(err, catalog.ErrNamespaceAlreadyExists) {
-			return nil, fmt.Errorf("create iceberg namespace %q: %w", namespace, err)
-		}
+	if err := ensureNamespace(ctx, a.catalog, namespace); err != nil {
+		return nil, errors.Trace(err)
 	}
 
 	schema, err := icebergtable.ArrowSchemaToIcebergWithFreshIDs(arrowSchemaForRows(rows), false)
@@ -140,15 +191,88 @@ func (a *icebergAppender) createTable(
 		return nil, errors.Trace(err)
 	}
 
-	tbl, err := a.catalog.CreateTable(ctx, ident, schema, catalog.WithProperties(iceberggo.Properties{
+	props := iceberggo.Properties{
 		"format-version":       "2",
 		"write.format.default": "parquet",
-	}))
+	}
+	if ownerID != "" {
+		props[tableOwnerIDKey] = ownerID
+	}
+	if changefeed != "" {
+		props[tableOwnerKey] = changefeed
+	}
+	if cdcClusterID != "" {
+		props[tableCDCClusterIDKey] = cdcClusterID
+	}
+	if upstreamID != "" {
+		props[tableUpstreamIDKey] = upstreamID
+	}
+
+	tbl, err := a.catalog.CreateTable(ctx, ident, schema, catalog.WithProperties(props))
 	if err != nil {
 		if stderrors.Is(err, catalog.ErrTableAlreadyExists) {
-			return a.catalog.LoadTable(ctx, ident)
+			loaded, err := a.catalog.LoadTable(ctx, ident)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateTargetOwner(loaded, ownerID, changefeed); err != nil {
+				return nil, errors.Trace(err)
+			}
+			return loaded, nil
 		}
 		return nil, fmt.Errorf("create iceberg table %q: %w", identifier, err)
 	}
 	return tbl, nil
+}
+
+func ensureNamespace(ctx context.Context, cat namespaceEnsurer, namespace icebergtable.Identifier) error {
+	if len(namespace) == 0 {
+		return nil
+	}
+	err := cat.CreateNamespace(ctx, namespace, iceberggo.Properties{})
+	if err == nil || stderrors.Is(err, catalog.ErrNamespaceAlreadyExists) {
+		return nil
+	}
+	exists, checkErr := cat.CheckNamespaceExists(ctx, namespace)
+	if checkErr == nil && exists {
+		return nil
+	}
+	if checkErr != nil {
+		return fmt.Errorf("create iceberg namespace %q: %w; check namespace existence: %v",
+			namespace, err, checkErr)
+	}
+	return fmt.Errorf("create iceberg namespace %q: %w", namespace, err)
+}
+
+func validateTargetOwner(tbl *icebergtable.Table, ownerID string, changefeed string) error {
+	if ownerID == "" && changefeed == "" {
+		return nil
+	}
+	if existing := tbl.Properties()[tableOwnerIDKey]; existing != "" && existing != ownerID {
+		return errors.Annotatef(errIcebergTargetOwnerConflict,
+			"owner %q conflicts with owner %q", existing, ownerID)
+	}
+	if existing := tbl.Properties()[tableOwnerKey]; existing != "" && changefeed != "" && existing != changefeed {
+		return errors.Annotatef(errIcebergTargetOwnerConflict,
+			"owner changefeed %q conflicts with changefeed %q", existing, changefeed)
+	}
+	for _, snapshot := range tbl.Metadata().Snapshots() {
+		if snapshot.Summary == nil {
+			continue
+		}
+		existingOwnerID := snapshot.Summary.Properties[snapshotOwnerIDKey]
+		if existingOwnerID != "" && existingOwnerID != ownerID {
+			return errors.Annotatef(errIcebergTargetOwnerConflict,
+				"snapshot owner %q conflicts with owner %q", existingOwnerID, ownerID)
+		}
+		if existingOwnerID != "" {
+			continue
+		}
+		existingChangefeed := snapshot.Summary.Properties[snapshotChangefeedKey]
+		if existingChangefeed != "" && changefeed != "" && existingChangefeed != changefeed {
+			return errors.Annotatef(errIcebergTargetOwnerConflict,
+				"snapshot owner changefeed %q conflicts with changefeed %q", existingChangefeed, changefeed)
+		}
+	}
+	return nil
 }

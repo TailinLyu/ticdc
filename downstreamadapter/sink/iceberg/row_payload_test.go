@@ -70,6 +70,46 @@ func TestBuildPayloadRowsForInsertUpdateDelete(t *testing.T) {
 	require.EqualValues(t, map[string]any{"id": int64(3), "name": "gone"}, deleteRows[0]["old"])
 }
 
+func TestBuildPayloadRowsUsesStableStagingRowIDAcrossReplaySeq(t *testing.T) {
+	tableInfo := newPayloadTestTableInfo()
+
+	first := newPayloadTestEvent(tableInfo, 10, 20)
+	first.Seq = 1
+	first.RowTypes = []common.RowType{common.RowTypeInsert}
+	first.Length = 1
+	first.Rows = chunk.NewChunkWithCapacity(tableInfo.GetFieldSlice(), 1)
+	appendPayloadTestRow(first.Rows, 1, "alice")
+
+	replayed := newPayloadTestEvent(tableInfo, 10, 20)
+	replayed.Seq = 9
+	replayed.RowTypes = []common.RowType{common.RowTypeInsert}
+	replayed.Length = 1
+	replayed.Rows = chunk.NewChunkWithCapacity(tableInfo.GetFieldSlice(), 1)
+	appendPayloadTestRow(replayed.Rows, 1, "alice")
+
+	firstRows, err := buildPayloadRows(first)
+	require.NoError(t, err)
+	replayedRows, err := buildPayloadRows(replayed)
+	require.NoError(t, err)
+	require.Equal(t, firstRows[0][stagingRowIDField], replayedRows[0][stagingRowIDField])
+}
+
+func TestBuildPayloadRowsDistinguishesIdenticalRowsInSameEvent(t *testing.T) {
+	tableInfo := newPayloadTestTableInfo()
+
+	event := newPayloadTestEvent(tableInfo, 10, 20)
+	event.RowTypes = []common.RowType{common.RowTypeInsert, common.RowTypeInsert}
+	event.Length = 2
+	event.Rows = chunk.NewChunkWithCapacity(tableInfo.GetFieldSlice(), 2)
+	appendPayloadTestRow(event.Rows, 1, "alice")
+	appendPayloadTestRow(event.Rows, 1, "alice")
+
+	rows, err := buildPayloadRows(event)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	require.NotEqual(t, rows[0][stagingRowIDField], rows[1][stagingRowIDField])
+}
+
 func newPayloadTestTableInfo() *common.TableInfo {
 	idType := types.NewFieldType(mysql.TypeLong)
 	idType.AddFlag(mysql.PriKeyFlag | mysql.NotNullFlag)

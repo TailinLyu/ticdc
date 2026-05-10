@@ -84,6 +84,33 @@ var (
 		}, []string{getKeyspaceLabel(), "changefeed", "event_type"})
 )
 
+// ---------- Metrics for Iceberg sink. ---------- //
+var (
+	IcebergStagedFilesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_staged_files",
+			Help:      "Number of staged Iceberg files for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed", "state"})
+
+	IcebergStagedRowsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_staged_rows",
+			Help:      "Number of rows in staged Iceberg files for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed", "state"})
+
+	IcebergTargetOwnerConflictCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_target_owner_conflicts_total",
+			Help:      "Total count of unsupported Iceberg target owner conflicts.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+)
+
 // ---------- Metrics for txn sink and backends. ---------- //
 var (
 	// ConflictDetectDuration records the duration of detecting conflict.
@@ -234,6 +261,10 @@ func initSinkMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(ExecDMLEventCounter)
 	registry.MustRegister(ExecDMLEventRowsAffectedCounter)
 	registry.MustRegister(ExecutionErrorCounter)
+
+	registry.MustRegister(IcebergStagedFilesGauge)
+	registry.MustRegister(IcebergStagedRowsGauge)
+	registry.MustRegister(IcebergTargetOwnerConflictCounter)
 
 	registry.MustRegister(ConflictDetectDuration)
 	registry.MustRegister(QueueDuration)

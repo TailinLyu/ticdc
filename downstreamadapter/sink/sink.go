@@ -58,7 +58,7 @@ func New(ctx context.Context, cfg *config.ChangefeedConfig, changefeedID common.
 	case config.S3Scheme, config.FileScheme, config.GCSScheme, config.GSScheme, config.AzblobScheme, config.AzureScheme, config.CloudStorageNoopScheme:
 		return cloudstorage.New(ctx, changefeedID, sinkURI, cfg.SinkConfig, cfg.EnableTableAcrossNodes, nil)
 	case config.IcebergScheme:
-		return iceberg.New(ctx, changefeedID, sinkURI, cfg.SinkConfig, cfg.EnableTableAcrossNodes)
+		return iceberg.New(ctx, changefeedID, sinkURI, cfg.SinkConfig, cfg.EnableTableAcrossNodes, cfg.UpstreamID)
 	case config.BlackHoleScheme:
 		return blackhole.New()
 	}

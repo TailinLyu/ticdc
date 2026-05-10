@@ -56,6 +56,12 @@ func (m *mockExternalStorage) URI() string { return "mock://" }
 
 func (m *mockExternalStorage) Close() {}
 
+type mockStrongExternalStorage struct {
+	mockExternalStorage
+}
+
+func (m *mockStrongExternalStorage) MarkStrongConsistency() {}
+
 // WriteFile simulates a write operation by making an HTTP request that respects context cancellation.
 func (m *mockExternalStorage) WriteFile(ctx context.Context, name string, data []byte) error {
 	if m.httpClient == nil {
@@ -133,6 +139,16 @@ func TestExtStorageWithTimeoutWriteFileSuccess(t *testing.T) {
 
 	// Assert success
 	require.NoError(t, err, "Expected no error for successful write within timeout")
+}
+
+func TestWrapExternalStorageWithTimeoutPreservesStrongConsistencyMarker(t *testing.T) {
+	strongStore := wrapExternalStorageWithTimeout(&mockStrongExternalStorage{}, time.Second)
+	_, ok := strongStore.(storage.StrongConsistency)
+	require.True(t, ok)
+
+	weakStore := wrapExternalStorageWithTimeout(&mockExternalStorage{}, time.Second)
+	_, ok = weakStore.(storage.StrongConsistency)
+	require.False(t, ok)
 }
 
 // ctxBoundReader is a reader that checks the context passed to Open().

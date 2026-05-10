@@ -26,7 +26,6 @@ const (
 	defaultCommitInterval = 60 * time.Second
 	defaultBatchRows      = 1024
 	defaultTableSuffix    = "_cdc"
-	defaultStagingDir     = "/tmp/ticdc-iceberg-staging"
 )
 
 // Config contains the local-first Iceberg sink settings parsed from sink-uri.
@@ -38,6 +37,11 @@ type Config struct {
 	TableSuffix    string
 	CommitInterval time.Duration
 	BatchRows      int
+
+	// Runtime owner identity. These fields are filled by TiCDC after parsing
+	// the sink URI and are used to reject unsupported shared-target writes.
+	TiCDCClusterID string
+	UpstreamID     uint64
 }
 
 // ParseConfig parses the iceberg:// sink URI. By default
@@ -77,7 +81,11 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 		}
 		cfg.StagingDir = stagingDir
 	} else {
-		cfg.StagingDir = defaultStagingPath(cfg.Warehouse)
+		stagingDir, err := defaultStagingPath(cfg.Warehouse)
+		if err != nil {
+			return nil, fmt.Errorf("iceberg sink URI must include staging-dir when warehouse is not a local path: %w", err)
+		}
+		cfg.StagingDir = stagingDir
 	}
 
 	if raw := query.Get("commit-interval"); raw != "" {
@@ -119,12 +127,12 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func defaultStagingPath(warehouse string) string {
+func defaultStagingPath(warehouse string) (string, error) {
 	warehousePath, err := localPathFromURI(warehouse)
 	if err == nil && warehousePath != "" {
-		return filepath.Join(warehousePath, ".ticdc-staging")
+		return filepath.Join(warehousePath, ".ticdc-staging"), nil
 	}
-	return defaultStagingDir
+	return "", err
 }
 
 func localPathFromURI(raw string) (string, error) {

@@ -644,6 +644,9 @@ func (c *Controller) RemoveChangefeed(ctx context.Context, id common.ChangeFeedI
 		c.apiLock.Unlock()
 		return 0, errors.New("changefeed not found")
 	}
+	info := cf.GetInfo()
+	sinkURI := info.SinkURI
+	upstreamID := info.UpstreamID
 	err := c.backend.SetChangefeedProgress(ctx, id, config.ProgressRemoving)
 	if err != nil {
 		c.apiLock.Unlock()
@@ -662,6 +665,7 @@ func (c *Controller) RemoveChangefeed(ctx context.Context, id common.ChangeFeedI
 		count += 1
 		log.Info("wait for stop changefeed operator finished", zap.Int("count", count), zap.Any("id", id))
 	}
+	cleanupRemovedChangefeedSinkArtifacts(id, sinkURI, upstreamID)
 	return cf.GetStatus().CheckpointTs, nil
 }
 

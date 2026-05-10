@@ -50,6 +50,25 @@ func TestParseConfigAllowsExplicitCatalogURI(t *testing.T) {
 	require.Equal(t, "_cdc", cfg.TableSuffix)
 }
 
+func TestParseConfigRequiresExplicitStagingDirForRemoteWarehouse(t *testing.T) {
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=s3://bucket/warehouse")
+	require.NoError(t, err)
+
+	_, err = ParseConfig(uri)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must include staging-dir")
+}
+
+func TestParseConfigAllowsRemoteWarehouseWithExplicitStagingDir(t *testing.T) {
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=s3://bucket/warehouse&staging-dir=file:///mnt/shared/ticdc-stage")
+	require.NoError(t, err)
+
+	cfg, err := ParseConfig(uri)
+	require.NoError(t, err)
+	require.Equal(t, "s3://bucket/warehouse", cfg.Warehouse)
+	require.Equal(t, "/mnt/shared/ticdc-stage", cfg.StagingDir)
+}
+
 func TestTargetIdentifier(t *testing.T) {
 	cfg := Config{
 		DatabasePrefix: "tidb_",

@@ -83,6 +83,17 @@ func buildPayloadRows(event *commonEvent.DMLEvent) ([]map[string]any, error) {
 		default:
 			return nil, errors.Errorf("unsupported iceberg row type %d", row.RowType)
 		}
+		rowID, err := stagingRowIDForEvent(
+			event.PhysicalTableID,
+			event.StartTs,
+			event.CommitTs,
+			len(rows),
+			row.RowKey,
+			payload)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		payload[stagingRowIDField] = rowID
 		rows = append(rows, payload)
 	}
 	return rows, nil

@@ -20,6 +20,8 @@ failure recovery, high concurrency, and SQL readback from Iceberg.
 - `tidbexec/main.go`: tiny SQL helper used by the test harness.
 - `iceberg_case_lib.sh`: shell helpers for changefeed creation, readback waits,
   staged-file counting, and log-based writer/committer ownership checks.
+- `run_s15_owner_guard.sh`: repeatable local scenario that verifies
+  many-changefeed-to-one-target is rejected by the warehouse owner marker.
 - `ICEBERG_RESILIENCE_MATRIX.md`: durable scenario checklist.
 - `ICEBERG_RESILIENCE_RESULTS.md`: scenario-by-scenario evidence and final
   verification output.
@@ -58,9 +60,8 @@ From the TiCDC repo root:
 
 ```bash
 # Build a failpoint-enabled TiCDC binary for the local Docker image.
-make failpoint-enable
-GOOS=linux GOARCH=arm64 go build -o bin/cdc-linux-arm64 ./cmd/cdc
-make failpoint-disable
+GOOS=linux GOARCH=arm64 CGO=0 make build-cdc-with-failpoint
+cp bin/cdc bin/cdc-linux-arm64
 
 # Build the local TiCDC image.
 docker build -f local-e2e/ticdc.Dockerfile -t local/ticdc-iceberg:e2e .
@@ -194,9 +195,13 @@ Main correctness gaps:
   S19, and appears in rolling restart S20.
 - A writer can stage a file, fail before `PostFlush`, and replay the same event
   from upstream while the durable staged file is also drained. This affects S05.
-- Committer uniqueness is scoped to one changefeed, not to one Iceberg target
-  table. Two changefeeds writing the same target duplicate the stream. This
-  affects S15 and S24.
+- Multiple changefeeds writing the same Iceberg target table are unsupported.
+  The sink now records a target-owner marker under the shared warehouse and
+  rejects a second owner before appending, including across TiCDC clusters that
+  share an S3/file warehouse. This affects S15 and S24.
+- MinIO/S3-compatible coverage exists for the owner marker through
+  `run_s16_minio_owner_marker.sh`; staged files are still local/shared-path
+  JSON and need follow-up before S3-native high-throughput staging.
 - Iceberg REST DNS/catalog outage did not recover automatically after REST came
   back; TiCDC restart drained the backlog. This affects S09.
 - The local Tabulario REST catalog uses a SQLite/JDBC backend and became the
@@ -218,6 +223,18 @@ Fresh verification used before opening the PR:
 ```bash
 go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg \
   ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1
+```
+
+The same-target unsupported guard can be rerun with:
+
+```bash
+local-e2e/run_s15_owner_guard.sh
+```
+
+The S3-compatible warehouse owner-marker coverage uses the local MinIO service:
+
+```bash
+local-e2e/run_s16_minio_owner_marker.sh
 ```
 
 Final local health checks:
