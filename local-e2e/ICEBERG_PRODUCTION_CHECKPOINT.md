@@ -55,11 +55,14 @@ matrix.
 - Replayed DML row IDs are stable across processor restart splits when TiCDC
   does not populate raw `RowKey`: the sink falls back to the table primary/handle
   key and only uses row index for tables without a usable logical key.
-- The committer keeps a bounded per-target committed-row-ID cache across drain
-  cycles. This closes the partial-overlap replay case where a later staged batch
-  has a different batch ID but repeats some rows already committed in an earlier
-  drain. The cache is intentionally bounded; the durable long-term answer remains
-  Iceberg-native committables with a target-level commit protocol.
+- Partial-overlap replay dedupe is restart-safe because staged-file cleanup is
+  deferred until the end of a drain and committed staged evidence is retained
+  while the same target still has later staged files waiting. Duplicate-only
+  replay batches are durably marked handled before cleanup, so a partial delete
+  cannot turn a retained no-op batch into a future append. A bounded per-target
+  row-ID cache remains as an in-process optimization, not the correctness
+  boundary. The durable long-term answer remains Iceberg-native committables
+  with a target-level commit protocol.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are explicitly
   unsupported for now. Bootstrap/not-sync create DDL remains allowed. Unsupported
   live DDL fails the changefeed instead of silently producing partial semantics.
@@ -77,9 +80,9 @@ matrix.
     metrics, committed row metrics, and ledger write/lookup metrics.
   - Focused review regressions cover staged-file fsync plus parent-directory
     fsync before return, candidate-bounded snapshot-summary dedupe, and
-    partial-overlap replay dedupe across drain cycles.
+    restart-safe partial-overlap replay dedupe.
 - Replay/crash reruns:
-  - `S03_REPLAY_PASS cf=s03-replay-1778397886 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S03_REPLAY_PASS cf=s03-replay-1778399480 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
   - `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0`

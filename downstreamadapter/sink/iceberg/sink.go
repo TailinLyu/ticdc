@@ -97,9 +97,9 @@ type preparedStagedFile struct {
 	rowIDs []string
 }
 
-// committedRowIDCache bridges partial-overlap replays across drain cycles. Batch
-// IDs catch whole-batch replays; this cache catches repeated rows that arrive in
-// a later batch with a different batch ID.
+// committedRowIDCache optimizes partial-overlap replays within one committer
+// process. Durable correctness comes from retaining staged evidence until later
+// staged files for the same target become eligible.
 type committedRowIDCache struct {
 	set   map[string]struct{}
 	order []string
@@ -379,6 +379,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	latestStagedCommitTs := latestStagedCommitTsByIdentifier(stagedFiles)
 	s.recordStageMetrics(stagedFiles, eligibleStagedFiles(stagedFiles, checkpointTs))
 
 	eligible := stagedFiles[:0]
@@ -456,6 +457,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 	currentGroups := make(map[string]*stagedDrainGroup)
 	rowIDsByIdentifier := make(map[string]map[string]struct{})
 	groups := make([]*stagedDrainGroup, 0)
+	deleteQueue := make([]stagedFile, 0, len(eligible))
 	for _, preparedFile := range prepared {
 		staged := preparedFile.file
 		rowIDs := preparedFile.rowIDs
@@ -474,10 +476,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			if err := s.markBatchesCommitted(ctx, staged.batch.Identifier, []string{staged.batch.BatchID}, staged.batch.MaxCommitTs, len(staged.batch.Rows)); err != nil {
 				return errors.Trace(err)
 			}
-			if stagedBatchSafeToDelete(staged.batch, checkpointTs) {
-				if err := s.stage.Delete(staged.path); err != nil {
-					return errors.Trace(err)
-				}
+			deleteQueued := stagedBatchSafeToDelete(staged.batch, checkpointTs, latestStagedCommitTs[key])
+			if deleteQueued {
+				deleteQueue = append(deleteQueue, staged)
 			}
 			log.Info("iceberg committer skipped already committed staged batch",
 				zap.String("changefeed", s.changefeedID.String()),
@@ -485,7 +486,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 				zap.String("batchID", staged.batch.BatchID),
 				zap.Int("rows", len(staged.batch.Rows)),
 				zap.Uint64("maxCommitTs", staged.batch.MaxCommitTs),
-				zap.Bool("deleted", stagedBatchSafeToDelete(staged.batch, checkpointTs)))
+				zap.Bool("deleteQueued", deleteQueued))
 			continue
 		}
 
@@ -519,16 +520,22 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 
 	for _, group := range groups {
 		if len(group.rows) == 0 {
-			if err := s.deleteStagedFiles(group.files); err != nil {
+			if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, 0); err != nil {
 				return errors.Trace(err)
 			}
-			log.Info("iceberg committer deleted duplicate staged rows",
+			groupKey := identifierKey(group.identifier)
+			deleteQueued := stagedGroupSafeToDelete(group, checkpointTs, latestStagedCommitTs[groupKey])
+			if deleteQueued {
+				deleteQueue = append(deleteQueue, group.files...)
+			}
+			log.Info("iceberg committer handled duplicate staged rows",
 				zap.String("changefeed", s.changefeedID.String()),
 				zap.Strings("identifier", group.identifier),
 				zap.Int("files", len(group.files)),
 				zap.Strings("batchIDs", group.batchIDs),
 				zap.Uint64("maxCommitTs", group.maxCommitTs),
-				zap.Uint64("checkpointTs", checkpointTs))
+				zap.Uint64("checkpointTs", checkpointTs),
+				zap.Bool("deleteQueued", deleteQueued))
 			continue
 		}
 
@@ -559,8 +566,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 					return errors.Trace(err)
 				}
 				s.rememberCommittedRowIDs(identifierKey(group.identifier), group.rowIDs)
-				if err := s.deleteStagedFiles(group.files); err != nil {
-					return errors.Trace(err)
+				groupKey := identifierKey(group.identifier)
+				if stagedGroupSafeToDelete(group, checkpointTs, latestStagedCommitTs[groupKey]) {
+					deleteQueue = append(deleteQueue, group.files...)
 				}
 				continue
 			}
@@ -601,10 +609,10 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 				zap.Uint64("maxCommitTs", group.maxCommitTs))
 			os.Exit(78)
 		})
-		if stagedGroupSafeToDelete(group, checkpointTs) {
-			if err := s.deleteStagedFiles(group.files); err != nil {
-				return errors.Trace(err)
-			}
+		groupKey := identifierKey(group.identifier)
+		deleteQueued := stagedGroupSafeToDelete(group, checkpointTs, latestStagedCommitTs[groupKey])
+		if deleteQueued {
+			deleteQueue = append(deleteQueue, group.files...)
 		}
 		log.Info("iceberg committer appended staged rows",
 			zap.String("changefeed", s.changefeedID.String()),
@@ -613,7 +621,12 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			zap.Int("batches", len(group.batchIDs)),
 			zap.Uint64("maxCommitTs", group.maxCommitTs),
 			zap.Uint64("checkpointTs", checkpointTs),
-			zap.Bool("deleted", stagedGroupSafeToDelete(group, checkpointTs)))
+			zap.Bool("deleteQueued", deleteQueued))
+	}
+	if len(deleteQueue) > 0 {
+		if err := s.deleteStagedFiles(deleteQueue); err != nil {
+			return errors.Trace(err)
+		}
 	}
 	if err := s.refreshStageMetrics(ctx, checkpointTs); err != nil {
 		log.Warn("failed to refresh iceberg staged metrics",
@@ -859,12 +872,23 @@ func stagedOldestAgeSeconds(stagedFiles []stagedFile) float64 {
 	return age.Seconds()
 }
 
-func stagedGroupSafeToDelete(group *stagedDrainGroup, checkpointTs uint64) bool {
-	return checkpointTs != 0 && group.maxCommitTs <= checkpointTs
+func stagedGroupSafeToDelete(group *stagedDrainGroup, checkpointTs uint64, latestStagedCommitTs uint64) bool {
+	return checkpointTs != 0 && group.maxCommitTs <= checkpointTs && latestStagedCommitTs <= checkpointTs
 }
 
-func stagedBatchSafeToDelete(batch stagedBatch, checkpointTs uint64) bool {
-	return checkpointTs != 0 && batch.MaxCommitTs <= checkpointTs
+func stagedBatchSafeToDelete(batch stagedBatch, checkpointTs uint64, latestStagedCommitTs uint64) bool {
+	return checkpointTs != 0 && batch.MaxCommitTs <= checkpointTs && latestStagedCommitTs <= checkpointTs
+}
+
+func latestStagedCommitTsByIdentifier(stagedFiles []stagedFile) map[string]uint64 {
+	latest := make(map[string]uint64)
+	for _, staged := range stagedFiles {
+		key := identifierKey(staged.batch.Identifier)
+		if staged.batch.MaxCommitTs > latest[key] {
+			latest[key] = staged.batch.MaxCommitTs
+		}
+	}
+	return latest
 }
 
 func uniqueStagedRows(

@@ -216,11 +216,12 @@ Remaining intentional limitations:
   staged files and committed ledger markers for at least the maximum replay
   horizon. Ledger lookup is direct by candidate marker path, and Iceberg
   snapshot-summary dedupe scans newest-first and stops once the current staged
-  batch candidates are found. The committer also keeps a bounded per-target
-  row-ID cache across drain cycles to suppress partial-overlap replays where a
-  later staged batch has a different batch ID but repeats already committed
-  rows. Native Iceberg data-file committables remain the target production
-  design.
+  batch candidates are found. Partial-overlap replay is restart-safe because
+  staged-file cleanup is deferred until the end of a drain, and committed staged
+  evidence is retained while the same target still has later staged files
+  waiting; duplicate-only replay batches are marked handled before cleanup, and
+  the bounded row-ID cache is only an in-process optimization. Native Iceberg
+  data-file committables remain the target production design.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
   `run_s17_schema_unsupported.sh` and
   `run_s17_create_table_unsupported.sh` verify that live DDL is rejected

@@ -24,7 +24,7 @@ Full evidence is in `local-e2e/ICEBERG_RESILIENCE_RESULTS.md`.
 
 | ID | Status | Fresh local evidence | Fix / interpretation |
 | --- | --- | --- | --- |
-| S03 | PASS | `S03_REPLAY_PASS cf=s03-replay-1778397886 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Retained staged files are skipped by committed batch IDs from Iceberg snapshots plus the durable shared-staging ledger; replayed keyed rows use stable table-key row IDs; target ownership is claimed before the stage file is exposed; and a bounded row-ID cache now suppresses partial-overlap duplicates across drain cycles. |
+| S03 | PASS | `S03_REPLAY_PASS cf=s03-replay-1778399480 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Retained staged files are skipped by committed batch IDs from Iceberg snapshots plus the durable shared-staging ledger; replayed keyed rows use stable table-key row IDs; target ownership is claimed before the stage file is exposed; staged evidence is retained across committer restart until later staged files for the same target become eligible; and duplicate-only replay batches are durably marked handled before cleanup. |
 | S05 | PASS | `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Durable stage plus unacked upstream replay no longer duplicates rows; the latest rerun also emitted commit duration, committed row, committed batch, and ledger write/lookup metrics. |
 | S09 | PASS | `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0` | Catalog recovery now drains automatically after REST returns; no TiCDC restart required in the local replay. |
 | S11 | PASS | `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0` | Append succeeded but cleanup failed is idempotent on retry. |
@@ -41,8 +41,9 @@ directory before deleting staged files. Staged JSON files are published with
 temp write, file fsync, close, atomic rename, and parent directory fsync before
 upstream progress is acknowledged. Ledger lookup checks only candidate staged
 batch IDs by marker path, and Iceberg snapshot-summary dedupe scans newest-first
-and stops once those candidates are found. A bounded per-target committed-row-ID
-cache covers partial-overlap replay within the active committer process.
+and stops once those candidates are found. Partial-overlap replay is
+restart-safe because cleanup is deferred until drain end, and committed staged
+evidence is retained while the same target still has later staged files waiting.
 Operators must retain staged files and ledger markers for the maximum replay
 horizon. The next production design should still replace JSON staging with
 Iceberg-native committables:

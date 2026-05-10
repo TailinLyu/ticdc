@@ -15,6 +15,7 @@ package iceberg
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
 	"io/fs"
 	"net/url"
@@ -626,14 +627,6 @@ func TestCommitterDeduplicatesRowsCommittedInPriorDrain(t *testing.T) {
 			"data":            map[string]any{"id": int64(1)},
 		},
 	}, 10))
-
-	s := newSink(ctx, changefeedID, cfg, writer)
-	s.SetTableSchemaStore(nil)
-
-	require.NoError(t, s.drainStaged(ctx, 10))
-	require.Len(t, writer.getCalls(), 1)
-	require.Zero(t, stageFileCount(t, cfg.StagingDir))
-
 	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
 		{
 			"_op":             "I",
@@ -643,10 +636,31 @@ func TestCommitterDeduplicatesRowsCommittedInPriorDrain(t *testing.T) {
 			stagingRowIDField: "stable-replay-row",
 			"data":            map[string]any{"id": int64(1)},
 		},
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(20),
+			"_table_id":       int64(101),
+			stagingRowIDField: "new-row",
+			"data":            map[string]any{"id": int64(2)},
+		},
 	}, 20))
 
-	require.NoError(t, s.drainStaged(ctx, 20))
+	s := newSink(ctx, changefeedID, cfg, writer)
+	s.SetTableSchemaStore(nil)
+
+	require.NoError(t, s.drainStaged(ctx, 10))
 	require.Len(t, writer.getCalls(), 1)
+	require.Equal(t, 2, stageFileCount(t, cfg.StagingDir))
+
+	restarted := newSink(ctx, changefeedID, cfg, writer)
+	restarted.SetTableSchemaStore(nil)
+
+	require.NoError(t, restarted.drainStaged(ctx, 20))
+	calls := writer.getCalls()
+	require.Len(t, calls, 2)
+	require.Len(t, calls[1].rows, 1)
+	data := calls[1].rows[0]["data"].(map[string]any)
+	require.Equal(t, "2", data["id"].(json.Number).String())
 	require.Zero(t, stageFileCount(t, cfg.StagingDir))
 }
 
@@ -832,6 +846,61 @@ func TestCommitterWritesDurableLedgerBeforeDeletingStageFile(t *testing.T) {
 	require.Contains(t, ledger, batchID)
 }
 
+func TestCommitterMarksDuplicateOnlyReplayBatchCommitted(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(10),
+			"_table_id":       int64(101),
+			stagingRowIDField: "stable-replay-row",
+			"data":            map[string]any{"id": int64(1)},
+		},
+	}, 10))
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(20),
+			"_table_id":       int64(101),
+			stagingRowIDField: "stable-replay-row",
+			"data":            map[string]any{"id": int64(1)},
+		},
+	}, 20))
+	files, err := stage.List(ctx, changefeedID.String())
+	require.NoError(t, err)
+	require.Len(t, files, 2)
+	var duplicateOnlyBatchID string
+	for _, file := range files {
+		if file.batch.MaxCommitTs == 20 {
+			duplicateOnlyBatchID = file.batch.BatchID
+		}
+	}
+	require.NotEmpty(t, duplicateOnlyBatchID)
+
+	s := newSink(ctx, changefeedID, cfg, writer)
+	s.SetTableSchemaStore(nil)
+	require.NoError(t, s.drainStaged(ctx, 10))
+	require.Len(t, writer.getCalls(), 1)
+	require.Equal(t, 2, stageFileCount(t, cfg.StagingDir))
+
+	restarted := newSink(ctx, changefeedID, cfg, writer)
+	restarted.SetTableSchemaStore(nil)
+	require.NoError(t, restarted.drainStaged(ctx, 20))
+	require.Len(t, writer.getCalls(), 1)
+	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+
+	ledger, err := stage.CommittedBatchesForCandidates(ctx, changefeedID.String(), identifier, []string{duplicateOnlyBatchID})
+	require.NoError(t, err)
+	require.Contains(t, ledger, duplicateOnlyBatchID)
+}
+
 func TestStageListSkipsCommittedLedgerSubtree(t *testing.T) {
 	ctx := context.Background()
 
@@ -992,7 +1061,7 @@ func TestCommitterLeavesFutureStagedBatchesUntilCheckpoint(t *testing.T) {
 
 	s.AddCheckpointTs(10)
 	require.Eventually(t, func() bool {
-		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 1
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 2
 	}, 3*time.Second, 10*time.Millisecond)
 	require.Equal(t, "10", writer.getCalls()[0].props[snapshotCommitBarrierTsKey])
 	require.NotContains(t, writer.getCalls()[0].props, "ticdc.checkpoint-ts")
