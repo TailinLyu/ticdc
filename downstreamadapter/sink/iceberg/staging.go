@@ -66,6 +66,12 @@ type stageStore struct {
 	root string
 }
 
+var syncFileForAtomicWrite = func(file *os.File) error {
+	return file.Sync()
+}
+
+var syncDirForAtomicWrite = syncDirectory
+
 func newStageStore(root string) *stageStore {
 	return &stageStore{root: root}
 }
@@ -89,7 +95,7 @@ func (s *stageStore) Write(
 	}
 
 	dir := filepath.Join(s.root, pathSegment(changefeed), pathSegment(identifierKey(identifier)))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
 		return errors.Trace(err)
 	}
 
@@ -108,18 +114,6 @@ func (s *stageStore) Write(
 		return errors.Trace(err)
 	}
 
-	tmp, err := os.CreateTemp(dir, ".stage-*.tmp")
-	if err != nil {
-		return errors.Trace(err)
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
 	batch := stagedBatch{
 		Changefeed:  changefeed,
 		BatchID:     batchID,
@@ -130,20 +124,9 @@ func (s *stageStore) Write(
 		MaxCommitTs: maxCommitTs,
 		CreatedAt:   time.Now().UTC(),
 	}
-	encoder := json.NewEncoder(tmp)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(&batch); err != nil {
-		_ = tmp.Close()
+	if err := writeJSONFileAtomically(dir, ".stage-*.tmp", finalName, &batch); err != nil {
 		return errors.Trace(err)
 	}
-	if err := tmp.Close(); err != nil {
-		return errors.Trace(err)
-	}
-
-	if err := os.Rename(tmpName, finalName); err != nil {
-		return errors.Trace(err)
-	}
-	cleanup = false
 	return nil
 }
 
@@ -233,7 +216,7 @@ func (s *stageStore) MarkBatchesCommitted(
 	}
 
 	dir := committedBatchLedgerDir(s.root, changefeed, identifier)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
 		return 0, errors.Trace(err)
 	}
 	created := 0
@@ -335,7 +318,7 @@ func (s *stageStore) ClaimTargetOwner(ctx context.Context, changefeed string, id
 	}
 
 	dir := filepath.Join(s.root, ".owners")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
 		return errors.Trace(err)
 	}
 	path := filepath.Join(dir, pathSegment(identifierKey(identifier))+".owner")
@@ -443,7 +426,11 @@ func readCommittedBatchRecord(path string) (committedBatchRecord, error) {
 }
 
 func writeCommittedBatchRecord(dir string, finalName string, record committedBatchRecord) error {
-	tmp, err := os.CreateTemp(dir, ".ledger-*.tmp")
+	return writeJSONFileAtomically(dir, ".ledger-*.tmp", finalName, &record)
+}
+
+func writeJSONFileAtomically(dir string, tmpPattern string, finalName string, value any) error {
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -457,11 +444,11 @@ func writeCommittedBatchRecord(dir string, finalName string, record committedBat
 
 	encoder := json.NewEncoder(tmp)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(&record); err != nil {
+	if err := encoder.Encode(value); err != nil {
 		_ = tmp.Close()
 		return errors.Trace(err)
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := syncFileForAtomicWrite(tmp); err != nil {
 		_ = tmp.Close()
 		return errors.Trace(err)
 	}
@@ -472,6 +459,59 @@ func writeCommittedBatchRecord(dir string, finalName string, record committedBat
 		return errors.Trace(err)
 	}
 	cleanup = false
+	if err := syncDirForAtomicWrite(dir); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func mkdirAllAndSyncParents(path string, perm os.FileMode) error {
+	cleanPath := filepath.Clean(path)
+	info, err := os.Stat(cleanPath)
+	if err == nil {
+		if !info.IsDir() {
+			return errors.Errorf("%s is not a directory", cleanPath)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return errors.Trace(err)
+	}
+
+	parent := filepath.Dir(cleanPath)
+	if parent != cleanPath {
+		if err := mkdirAllAndSyncParents(parent, perm); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	if err := os.Mkdir(cleanPath, perm); err != nil {
+		if !os.IsExist(err) {
+			return errors.Trace(err)
+		}
+		info, statErr := os.Stat(cleanPath)
+		if statErr != nil {
+			return errors.Trace(statErr)
+		}
+		if !info.IsDir() {
+			return errors.Errorf("%s is not a directory", cleanPath)
+		}
+		return nil
+	}
+	if parent != cleanPath {
+		return errors.Trace(syncDirForAtomicWrite(parent))
+	}
+	return nil
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return errors.Trace(err)
+	}
 	return nil
 }
 

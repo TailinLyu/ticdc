@@ -102,6 +102,7 @@ func (a *icebergAppender) AppendRows(
 func (a *icebergAppender) CommittedBatches(
 	ctx context.Context,
 	identifier []string,
+	batchIDs []string,
 ) (map[string]struct{}, error) {
 	tbl, err := a.catalog.LoadTable(ctx, icebergtable.Identifier(identifier))
 	if err != nil {
@@ -114,17 +115,31 @@ func (a *icebergAppender) CommittedBatches(
 	a.mu.Lock()
 	a.tables[identifierKey(identifier)] = tbl
 	a.mu.Unlock()
-	return tableCommittedBatches(tbl), nil
+	return tableCommittedBatchesForCandidates(tbl, batchIDs), nil
 }
 
-func tableCommittedBatches(tbl *icebergtable.Table) map[string]struct{} {
-	committedBatches := make(map[string]struct{})
-	for _, snapshot := range tbl.Metadata().Snapshots() {
+func tableCommittedBatchesForCandidates(tbl *icebergtable.Table, batchIDs []string) map[string]struct{} {
+	return snapshotCommittedBatchesForCandidates(tbl.Metadata().Snapshots(), batchIDs)
+}
+
+func snapshotCommittedBatchesForCandidates(snapshots []icebergtable.Snapshot, batchIDs []string) map[string]struct{} {
+	if len(batchIDs) == 0 {
+		return nil
+	}
+	candidates := make(map[string]struct{}, len(batchIDs))
+	for _, batchID := range batchIDs {
+		if batchID != "" {
+			candidates[batchID] = struct{}{}
+		}
+	}
+	committedBatches := make(map[string]struct{}, len(candidates))
+	for i := len(snapshots) - 1; i >= 0 && len(committedBatches) < len(candidates); i-- {
+		snapshot := snapshots[i]
 		if snapshot.Summary == nil {
 			continue
 		}
 		for _, committed := range batchIDsFromProps(snapshot.Summary.Properties) {
-			if committed != "" {
+			if _, ok := candidates[committed]; ok {
 				committedBatches[committed] = struct{}{}
 			}
 		}

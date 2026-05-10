@@ -209,13 +209,18 @@ Remaining intentional limitations:
   `run_s16_minio_owner_marker.sh`; staged files are still local/shared-path
   JSON and need follow-up before S3-native high-throughput staging. For now,
   every TiCDC capture must see the same `staging-dir` path, typically through a
-  shared filesystem or PVC.
+  shared filesystem or PVC. A staged JSON batch is made visible only after temp
+  write, file fsync, close, atomic rename, and parent directory fsync.
 - Replay dedupe now uses both Iceberg snapshot summaries and a durable committed
   ledger under `.committed` in the shared staging directory. Operators must retain
   staged files and committed ledger markers for at least the maximum replay
-  horizon. Ledger lookup is candidate-bounded by staged batch IDs being drained,
-  not by total retained marker history; native Iceberg data-file committables
-  remain the target production design.
+  horizon. Ledger lookup is direct by candidate marker path, and Iceberg
+  snapshot-summary dedupe scans newest-first and stops once the current staged
+  batch candidates are found. The committer also keeps a bounded per-target
+  row-ID cache across drain cycles to suppress partial-overlap replays where a
+  later staged batch has a different batch ID but repeats already committed
+  rows. Native Iceberg data-file committables remain the target production
+  design.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
   `run_s17_schema_unsupported.sh` and
   `run_s17_create_table_unsupported.sh` verify that live DDL is rejected

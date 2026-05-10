@@ -60,7 +60,7 @@ stable across replayed keyed rows even when TiCDC omits raw `RowKey` bytes.
 
 | ID | Scenario | Status | Fresh evidence | Notes |
 | --- | --- | --- | --- | --- |
-| S03 | Committer exits after Iceberg append but before staged-file delete | PASS | `S03_REPLAY_PASS cf=s03-replay-1778395364 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s03_append_exit_replay.sh`. A smaller rerun exposed a six-row duplicate when target ownership was claimed after staging; the final pass verifies the claim now happens before the stage file is visible. The latest code also adds a shared-staging committed-batch ledger so retained stage files are not deduped only by Iceberg snapshot summaries. |
+| S03 | Committer exits after Iceberg append but before staged-file delete | PASS | `S03_REPLAY_PASS cf=s03-replay-1778397886 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s03_append_exit_replay.sh`. A smaller rerun exposed a six-row duplicate when target ownership was claimed after staging; the final pass verifies the claim now happens before the stage file is visible. The latest code also adds a shared-staging committed-batch ledger and a bounded row-ID cache, so retained stage files are not deduped only by Iceberg snapshot summaries or whole-batch IDs. |
 | S05 | Non-committer exits after staging but before `PostFlush` | PASS | `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s05_stage_exit_replay.sh`. Metrics scrape after the run showed commit duration, committed batch, committed row, and ledger write/lookup counters on the surviving committer. |
 | S09 | Iceberg REST outage while staged files exist, then recovery | PASS | `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0` | REST was stopped, staged files accumulated, REST was restarted, and TiCDC drained without a TiCDC restart. |
 | S11 | Staged-file delete failure after successful append | PASS | `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s11_append_error_replay.sh`. |
@@ -86,11 +86,17 @@ documents and enforces the current PVC/shared-filesystem JSON staging boundary.
 The follow-up review loop changed replay lookup to exact candidate batch-marker
 checks, so retained historical `.commit` files are not walked on the commit
 path; corrupt or unrelated retained marker files do not affect unrelated staged
-batches.
+batches. The latest review loop also makes staged JSON publication durable with
+file fsync, close, rename, and parent-directory fsync before source progress can
+be acknowledged, and bounds Iceberg snapshot-summary dedupe to the current
+candidate staged batch IDs. A rebuilt-image S03 rerun then exposed a
+partial-overlap duplicate where a later staged batch had a different batch ID
+but repeated rows from an earlier drain; that is now covered by a bounded
+per-target committed-row-ID cache and a focused unit regression.
 
 Fresh local e2e reruns after the ledger and metrics patch:
 
-- `S03_REPLAY_PASS cf=s03-replay-1778395364 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+- `S03_REPLAY_PASS cf=s03-replay-1778397886 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
 - `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
 - Prometheus scrape for `s05-replay-1778393687` included
   `ticdc_sink_iceberg_commit_duration_seconds`,

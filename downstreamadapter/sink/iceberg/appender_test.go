@@ -62,3 +62,25 @@ func TestEnsureNamespaceReturnsCreateErrorWhenNamespaceStillMissing(t *testing.T
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "sqlite catalog busy")
 }
+
+func TestSnapshotCommittedBatchesForCandidatesFiltersUnrequestedHistory(t *testing.T) {
+	snapshots := []icebergtable.Snapshot{
+		{Summary: &icebergtable.Summary{Properties: iceberggo.Properties{
+			snapshotBatchIDKey: "old-unrequested",
+		}}},
+		{Summary: &icebergtable.Summary{Properties: iceberggo.Properties{
+			snapshotBatchIDsKey: "batch-a,batch-b",
+		}}},
+		{Summary: &icebergtable.Summary{Properties: iceberggo.Properties{
+			snapshotBatchIDKey: "latest",
+		}}},
+	}
+
+	committed := snapshotCommittedBatchesForCandidates(snapshots, []string{"batch-a", "latest", "missing"})
+
+	require.Contains(t, committed, "batch-a")
+	require.Contains(t, committed, "latest")
+	require.NotContains(t, committed, "batch-b")
+	require.NotContains(t, committed, "old-unrequested")
+	require.NotContains(t, committed, "missing")
+}

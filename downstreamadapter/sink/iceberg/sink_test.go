@@ -44,11 +44,12 @@ type appendCall struct {
 }
 
 type recordingAppendWriter struct {
-	mu        sync.Mutex
-	calls     []appendCall
-	err       error
-	committed map[string]map[string]struct{}
-	lookups   map[string]int
+	mu             sync.Mutex
+	calls          []appendCall
+	err            error
+	committed      map[string]map[string]struct{}
+	lookups        map[string]int
+	lookupBatchIDs map[string][][]string
 }
 
 func (r *recordingAppendWriter) AppendRows(
@@ -89,22 +90,31 @@ func (r *recordingAppendWriter) AppendRows(
 func (r *recordingAppendWriter) CommittedBatches(
 	_ context.Context,
 	identifier []string,
+	batchIDs []string,
 ) (map[string]struct{}, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.lookups == nil {
 		r.lookups = make(map[string]int)
 	}
-	r.lookups[identifierKey(identifier)]++
+	key := identifierKey(identifier)
+	r.lookups[key]++
+	if r.lookupBatchIDs == nil {
+		r.lookupBatchIDs = make(map[string][][]string)
+	}
+	r.lookupBatchIDs[key] = append(r.lookupBatchIDs[key], append([]string(nil), batchIDs...))
 	if r.err != nil {
 		return nil, r.err
 	}
 	if r.committed == nil {
 		return nil, nil
 	}
-	committedBatches := make(map[string]struct{}, len(r.committed[identifierKey(identifier)]))
-	for batchID := range r.committed[identifierKey(identifier)] {
-		committedBatches[batchID] = struct{}{}
+	source := r.committed[key]
+	committedBatches := make(map[string]struct{}, len(batchIDs))
+	for _, batchID := range batchIDs {
+		if _, ok := source[batchID]; ok {
+			committedBatches[batchID] = struct{}{}
+		}
 	}
 	return committedBatches, nil
 }
@@ -113,6 +123,17 @@ func (r *recordingAppendWriter) committedLookupCount(identifier []string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.lookups[identifierKey(identifier)]
+}
+
+func (r *recordingAppendWriter) committedLookupBatchIDs(identifier []string) [][]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lookups := r.lookupBatchIDs[identifierKey(identifier)]
+	copied := make([][]string, 0, len(lookups))
+	for _, lookup := range lookups {
+		copied = append(copied, append([]string(nil), lookup...))
+	}
+	return copied
 }
 
 func (r *recordingAppendWriter) setErr(err error) {
@@ -165,7 +186,7 @@ func TestSinkFlushesRowsOnCheckpoint(t *testing.T) {
 	s.AddCheckpointTs(42)
 
 	require.Eventually(t, func() bool {
-		return len(writer.getCalls()) == 1
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
 	}, 3*time.Second, 10*time.Millisecond)
 
 	select {
@@ -471,6 +492,12 @@ func TestCommitterLoadsCommittedBatchesOncePerTable(t *testing.T) {
 			{"_op": "I", "_commit_ts": int64(commitTs), "_table_id": int64(101), "data": map[string]any{"id": int64(i + 1)}},
 		}, commitTs))
 	}
+	files, err := stage.List(ctx, changefeedID.String())
+	require.NoError(t, err)
+	expectedBatchIDs := make([]string, 0, len(files))
+	for _, file := range files {
+		expectedBatchIDs = append(expectedBatchIDs, file.batch.BatchID)
+	}
 
 	s := newSink(ctx, changefeedID, cfg, writer)
 	s.SetTableSchemaStore(nil)
@@ -485,6 +512,9 @@ func TestCommitterLoadsCommittedBatchesOncePerTable(t *testing.T) {
 		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
 	}, 3*time.Second, 10*time.Millisecond)
 	require.Equal(t, 1, writer.committedLookupCount(identifier))
+	lookupBatchIDs := writer.committedLookupBatchIDs(identifier)
+	require.Len(t, lookupBatchIDs, 1)
+	require.ElementsMatch(t, expectedBatchIDs, lookupBatchIDs[0])
 
 	cancel()
 	require.NoError(t, <-errCh)
@@ -576,6 +606,48 @@ func TestCommitterDeduplicatesOverlappingStagedRows(t *testing.T) {
 
 	cancel()
 	require.NoError(t, <-errCh)
+}
+
+func TestCommitterDeduplicatesRowsCommittedInPriorDrain(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(10),
+			"_table_id":       int64(101),
+			stagingRowIDField: "stable-replay-row",
+			"data":            map[string]any{"id": int64(1)},
+		},
+	}, 10))
+
+	s := newSink(ctx, changefeedID, cfg, writer)
+	s.SetTableSchemaStore(nil)
+
+	require.NoError(t, s.drainStaged(ctx, 10))
+	require.Len(t, writer.getCalls(), 1)
+	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{
+			"_op":             "I",
+			"_commit_ts":      int64(10),
+			"_seq":            int64(7),
+			"_table_id":       int64(101),
+			stagingRowIDField: "stable-replay-row",
+			"data":            map[string]any{"id": int64(1)},
+		},
+	}, 20))
+
+	require.NoError(t, s.drainStaged(ctx, 20))
+	require.Len(t, writer.getCalls(), 1)
+	require.Zero(t, stageFileCount(t, cfg.StagingDir))
 }
 
 func TestCommitterPreservesDistinctRowsWithSamePayload(t *testing.T) {
@@ -782,6 +854,49 @@ func TestStageListSkipsCommittedLedgerSubtree(t *testing.T) {
 	files, err := stage.List(ctx, changefeedID.String())
 	require.NoError(t, err)
 	require.Len(t, files, 1)
+}
+
+func TestStageWriteSyncsFileAndDirectoryBeforeReturning(t *testing.T) {
+	ctx := context.Background()
+
+	oldSyncFile := syncFileForAtomicWrite
+	oldSyncDir := syncDirForAtomicWrite
+	defer func() {
+		syncFileForAtomicWrite = oldSyncFile
+		syncDirForAtomicWrite = oldSyncDir
+	}()
+
+	fileSynced := false
+	var syncedDirs []string
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	identifier := []string{"test", "orders_cdc"}
+	changefeedDir := filepath.Join(cfg.StagingDir, pathSegment(changefeedID.String()))
+	targetDir := filepath.Join(changefeedDir, pathSegment(identifierKey(identifier)))
+
+	syncFileForAtomicWrite = func(file *os.File) error {
+		require.NotEmpty(t, file.Name())
+		fileSynced = true
+		return nil
+	}
+	syncDirForAtomicWrite = func(path string) error {
+		if path == targetDir {
+			require.True(t, fileSynced, "target directory sync must happen after file sync")
+		}
+		syncedDirs = append(syncedDirs, path)
+		return nil
+	}
+
+	stage := newStageStore(cfg.StagingDir)
+
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+
+	require.True(t, fileSynced)
+	require.Contains(t, syncedDirs, cfg.StagingDir)
+	require.Contains(t, syncedDirs, changefeedDir)
+	require.Contains(t, syncedDirs, targetDir)
 }
 
 func TestStageCommittedBatchesUsesCandidateLookup(t *testing.T) {
@@ -1185,7 +1300,7 @@ func TestSinkPrefixesDatabase(t *testing.T) {
 	s.AddDMLEvent(event)
 	s.AddCheckpointTs(11)
 	require.Eventually(t, func() bool {
-		return len(writer.getCalls()) == 1
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
 	}, 3*time.Second, 10*time.Millisecond)
 	require.Equal(t, []string{"ticdc_shop", "customers_cdc"}, writer.getCalls()[0].identifier)
 

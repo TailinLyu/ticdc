@@ -43,7 +43,7 @@ type appendWriter interface {
 		tableSchema *stagedTableSchema,
 		snapshotProps iceberggo.Properties,
 	) error
-	CommittedBatches(ctx context.Context, identifier []string) (map[string]struct{}, error)
+	CommittedBatches(ctx context.Context, identifier []string, batchIDs []string) (map[string]struct{}, error)
 }
 
 type sink struct {
@@ -65,6 +65,8 @@ type sink struct {
 
 	ownerClaimsMu sync.Mutex
 	ownerClaims   map[string]struct{}
+
+	committedRowIDsByIdentifier map[string]*committedRowIDCache
 }
 
 type sinkCommand struct {
@@ -86,7 +88,21 @@ type stagedDrainGroup struct {
 	files       []stagedFile
 	rows        []map[string]any
 	batchIDs    []string
+	rowIDs      []string
 	maxCommitTs uint64
+}
+
+type preparedStagedFile struct {
+	file   stagedFile
+	rowIDs []string
+}
+
+// committedRowIDCache bridges partial-overlap replays across drain cycles. Batch
+// IDs catch whole-batch replays; this cache catches repeated rows that arrive in
+// a later batch with a different batch ID.
+type committedRowIDCache struct {
+	set   map[string]struct{}
+	order []string
 }
 
 type icebergFaultHookName int
@@ -118,6 +134,7 @@ const (
 
 	maxStagedFilesPerCommit = 100
 	maxRowsPerCommit        = 5000
+	maxCommittedRowIDCache  = maxRowsPerCommit * 4
 )
 
 var errIcebergTargetOwnerConflict = icebergcfg.ErrTargetOwnerConflict
@@ -154,18 +171,19 @@ func newSink(ctx context.Context, changefeedID common.ChangeFeedID, cfg *iceberg
 	}
 	ownerID := icebergcfg.TargetOwnerID(cfg.TiCDCClusterID, cfg.UpstreamID, changefeedID.String())
 	return &sink{
-		changefeedID:       changefeedID,
-		cfg:                cfg,
-		ownerID:            ownerID,
-		isNormal:           atomic.NewBool(true),
-		ctx:                ctx,
-		inputCh:            make(chan sinkCommand, 4096),
-		stage:              newStageStore(cfg.StagingDir),
-		isCommitter:        atomic.NewBool(false),
-		latestCheckpointTs: atomic.NewUint64(0),
-		writer:             writer,
-		injectedWriter:     writer != nil,
-		ownerClaims:        make(map[string]struct{}),
+		changefeedID:                changefeedID,
+		cfg:                         cfg,
+		ownerID:                     ownerID,
+		isNormal:                    atomic.NewBool(true),
+		ctx:                         ctx,
+		inputCh:                     make(chan sinkCommand, 4096),
+		stage:                       newStageStore(cfg.StagingDir),
+		isCommitter:                 atomic.NewBool(false),
+		latestCheckpointTs:          atomic.NewUint64(0),
+		writer:                      writer,
+		injectedWriter:              writer != nil,
+		ownerClaims:                 make(map[string]struct{}),
+		committedRowIDsByIdentifier: make(map[string]*committedRowIDCache),
 	}
 }
 
@@ -260,12 +278,18 @@ func (s *sink) Run(ctx context.Context) error {
 		case cmd := <-s.inputCh:
 			if cmd.dml != nil {
 				if err := s.bufferEvent(buffers, cmd.dml); err != nil {
+					if isContextDoneError(ctx, err) {
+						return nil
+					}
 					s.isNormal.Store(false)
 					return errors.Trace(err)
 				}
 				key := identifierKey(s.cfg.TargetIdentifier(cmd.dml.TableInfo.GetSchemaName(), cmd.dml.TableInfo.GetTableName()))
 				if len(buffers[key].rows) >= s.cfg.BatchRows {
 					if err := s.stageTable(ctx, buffers, key); err != nil {
+						if isContextDoneError(ctx, err) {
+							return nil
+						}
 						s.isNormal.Store(false)
 						return errors.Trace(err)
 					}
@@ -276,30 +300,50 @@ func (s *sink) Run(ctx context.Context) error {
 				s.latestCheckpointTs.Store(cmd.checkpointTs)
 			}
 			if err := s.stageAll(ctx, buffers); err != nil {
+				if isContextDoneError(ctx, err) {
+					return nil
+				}
 				s.isNormal.Store(false)
 				return errors.Trace(err)
 			}
 			if s.isCommitter.Load() {
 				failpoint.Inject("IcebergSinkBlockBeforeDrain", nil)
 				if err := s.drainStaged(ctx, cmd.checkpointTs); err != nil {
+					if isContextDoneError(ctx, err) {
+						return nil
+					}
 					s.isNormal.Store(false)
 					return errors.Trace(err)
 				}
 			}
 		case <-ticker.C:
 			if err := s.stageAll(ctx, buffers); err != nil {
+				if isContextDoneError(ctx, err) {
+					return nil
+				}
 				s.isNormal.Store(false)
 				return errors.Trace(err)
 			}
 			if s.isCommitter.Load() {
 				failpoint.Inject("IcebergSinkBlockBeforeDrain", nil)
 				if err := s.drainStaged(ctx, s.latestCheckpointTs.Load()); err != nil {
+					if isContextDoneError(ctx, err) {
+						return nil
+					}
 					s.isNormal.Store(false)
 					return errors.Trace(err)
 				}
 			}
 		}
 	}
+}
+
+func isContextDoneError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() == nil {
+		return false
+	}
+	cause := errors.Cause(err)
+	return cause == context.Canceled || cause == context.DeadlineExceeded || cause == ctx.Err()
 }
 
 func (s *sink) getWriter(ctx context.Context) (appendWriter, error) {
@@ -361,10 +405,10 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		return nil
 	}
 
-	currentGroups := make(map[string]*stagedDrainGroup)
-	rowIDsByIdentifier := make(map[string]map[string]struct{})
-	committedByIdentifier := make(map[string]map[string]struct{})
-	groups := make([]*stagedDrainGroup, 0)
+	prepared := make([]preparedStagedFile, 0, len(eligible))
+	candidateBatchIDsByIdentifier := make(map[string][]string)
+	candidateBatchIDSeenByIdentifier := make(map[string]map[string]struct{})
+	identifierByKey := make(map[string][]string)
 	for _, staged := range eligible {
 		rowIDs, err := stagedRowIDs(staged.batch.Identifier, staged.batch.Rows, staged.batch.RowIDs)
 		if err != nil {
@@ -379,39 +423,54 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			staged.batch.BatchID = batchID
 		}
 		key := identifierKey(staged.batch.Identifier)
-		seenRowIDs := rowIDsByIdentifier[key]
-		if seenRowIDs == nil {
-			seenRowIDs = make(map[string]struct{}, len(staged.batch.Rows))
-			rowIDsByIdentifier[key] = seenRowIDs
+		prepared = append(prepared, preparedStagedFile{file: staged, rowIDs: rowIDs})
+		if _, ok := identifierByKey[key]; !ok {
+			identifierByKey[key] = append([]string(nil), staged.batch.Identifier...)
 		}
-		committedBatches, ok := committedByIdentifier[key]
-		if !ok {
-			var err error
-			committedBatches, err = s.committedBatches(ctx, writer, staged.batch.Identifier)
-			if err != nil {
-				s.recordAppendFailure("committed_batch_lookup")
-				log.Warn("iceberg committer will retry after committed batch lookup failure",
-					zap.String("changefeed", s.changefeedID.String()),
-					zap.Strings("identifier", staged.batch.Identifier),
-					zap.Error(err))
-				s.resetWriter()
-				return nil
-			}
-			committedByIdentifier[key] = committedBatches
+		seenBatchIDs := candidateBatchIDSeenByIdentifier[key]
+		if seenBatchIDs == nil {
+			seenBatchIDs = make(map[string]struct{})
+			candidateBatchIDSeenByIdentifier[key] = seenBatchIDs
 		}
-		committed, err := s.committedBatch(ctx, committedBatches, staged.batch.Identifier, staged.batch.BatchID)
+		if _, ok := seenBatchIDs[staged.batch.BatchID]; !ok {
+			candidateBatchIDsByIdentifier[key] = append(candidateBatchIDsByIdentifier[key], staged.batch.BatchID)
+			seenBatchIDs[staged.batch.BatchID] = struct{}{}
+		}
+	}
+
+	committedByIdentifier := make(map[string]map[string]struct{}, len(candidateBatchIDsByIdentifier))
+	for key, batchIDs := range candidateBatchIDsByIdentifier {
+		committedBatches, err := s.committedBatches(ctx, writer, identifierByKey[key], batchIDs)
 		if err != nil {
 			s.recordAppendFailure("committed_batch_lookup")
 			log.Warn("iceberg committer will retry after committed batch lookup failure",
 				zap.String("changefeed", s.changefeedID.String()),
-				zap.Strings("identifier", staged.batch.Identifier),
-				zap.String("batchID", staged.batch.BatchID),
+				zap.Strings("identifier", identifierByKey[key]),
 				zap.Error(err))
 			s.resetWriter()
 			return nil
 		}
-		if committed {
+		committedByIdentifier[key] = committedBatches
+	}
+
+	currentGroups := make(map[string]*stagedDrainGroup)
+	rowIDsByIdentifier := make(map[string]map[string]struct{})
+	groups := make([]*stagedDrainGroup, 0)
+	for _, preparedFile := range prepared {
+		staged := preparedFile.file
+		rowIDs := preparedFile.rowIDs
+		key := identifierKey(staged.batch.Identifier)
+		seenRowIDs := rowIDsByIdentifier[key]
+		if seenRowIDs == nil {
+			seenRowIDs = s.committedRowIDs(key)
+			if seenRowIDs == nil {
+				seenRowIDs = make(map[string]struct{}, len(staged.batch.Rows))
+			}
+			rowIDsByIdentifier[key] = seenRowIDs
+		}
+		if _, committed := committedByIdentifier[key][staged.batch.BatchID]; committed {
 			rememberRowIDs(seenRowIDs, rowIDs)
+			s.rememberCommittedRowIDs(key, rowIDs)
 			if err := s.markBatchesCommitted(ctx, staged.batch.Identifier, []string{staged.batch.BatchID}, staged.batch.MaxCommitTs, len(staged.batch.Rows)); err != nil {
 				return errors.Trace(err)
 			}
@@ -430,7 +489,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			continue
 		}
 
-		uniqueRows, err := uniqueStagedRows(staged.batch.Rows, rowIDs, seenRowIDs)
+		uniqueRows, uniqueRowIDs, err := uniqueStagedRows(staged.batch.Rows, rowIDs, seenRowIDs)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -451,6 +510,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		}
 		group.files = append(group.files, staged)
 		group.rows = append(group.rows, uniqueRows...)
+		group.rowIDs = append(group.rowIDs, uniqueRowIDs...)
 		group.batchIDs = append(group.batchIDs, staged.batch.BatchID)
 		if staged.batch.MaxCommitTs > group.maxCommitTs {
 			group.maxCommitTs = staged.batch.MaxCommitTs
@@ -498,6 +558,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 				if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, len(group.rows)); err != nil {
 					return errors.Trace(err)
 				}
+				s.rememberCommittedRowIDs(identifierKey(group.identifier), group.rowIDs)
 				if err := s.deleteStagedFiles(group.files); err != nil {
 					return errors.Trace(err)
 				}
@@ -518,6 +579,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, len(group.rows)); err != nil {
 			return errors.Trace(err)
 		}
+		s.rememberCommittedRowIDs(identifierKey(group.identifier), group.rowIDs)
 		s.recordCommitDuration("success", time.Since(appendStart))
 		s.recordCommitSuccess(len(group.batchIDs), len(group.rows), checkpointTs, group.maxCommitTs)
 		if err := runIcebergFaultHook(icebergFaultAfterAppendBeforeStageDelete); err != nil {
@@ -561,37 +623,29 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 	return nil
 }
 
-func (s *sink) committedBatches(ctx context.Context, writer appendWriter, identifier []string) (map[string]struct{}, error) {
-	committedBatches, err := writer.CommittedBatches(ctx, identifier)
+func (s *sink) committedBatches(
+	ctx context.Context,
+	writer appendWriter,
+	identifier []string,
+	batchIDs []string,
+) (map[string]struct{}, error) {
+	committedBatches, err := writer.CommittedBatches(ctx, identifier, batchIDs)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	if committedBatches == nil {
 		committedBatches = make(map[string]struct{})
 	}
-	return committedBatches, nil
-}
-
-func (s *sink) committedBatch(
-	ctx context.Context,
-	committedBatches map[string]struct{},
-	identifier []string,
-	batchID string,
-) (bool, error) {
-	if _, committed := committedBatches[batchID]; committed {
-		return true, nil
-	}
-	ledgerBatches, err := s.stage.CommittedBatchesForCandidates(ctx, s.changefeedID.String(), identifier, []string{batchID})
+	ledgerBatches, err := s.stage.CommittedBatchesForCandidates(ctx, s.changefeedID.String(), identifier, batchIDs)
 	if err != nil {
 		s.recordCommittedLedgerLookup("error")
-		return false, errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
 	s.recordCommittedLedgerLookup("success")
-	if len(ledgerBatches) == 0 {
-		return false, nil
+	for batchID := range ledgerBatches {
+		committedBatches[batchID] = struct{}{}
 	}
-	committedBatches[batchID] = struct{}{}
-	return true, nil
+	return committedBatches, nil
 }
 
 func (s *sink) markBatchesCommitted(
@@ -817,20 +871,22 @@ func uniqueStagedRows(
 	rows []map[string]any,
 	rowIDs []string,
 	seenRowIDs map[string]struct{},
-) ([]map[string]any, error) {
+) ([]map[string]any, []string, error) {
 	if len(rowIDs) != len(rows) {
-		return nil, errors.Errorf("iceberg staged row id count %d does not match row count %d",
+		return nil, nil, errors.Errorf("iceberg staged row id count %d does not match row count %d",
 			len(rowIDs), len(rows))
 	}
 	uniqueRows := make([]map[string]any, 0, len(rows))
+	uniqueRowIDs := make([]string, 0, len(rows))
 	for i, rowID := range rowIDs {
 		if _, ok := seenRowIDs[rowID]; ok {
 			continue
 		}
 		seenRowIDs[rowID] = struct{}{}
 		uniqueRows = append(uniqueRows, rows[i])
+		uniqueRowIDs = append(uniqueRowIDs, rowID)
 	}
-	return uniqueRows, nil
+	return uniqueRows, uniqueRowIDs, nil
 }
 
 func rememberRowIDs(seenRowIDs map[string]struct{}, rowIDs []string) {
@@ -839,8 +895,47 @@ func rememberRowIDs(seenRowIDs map[string]struct{}, rowIDs []string) {
 	}
 }
 
+func (s *sink) committedRowIDs(key string) map[string]struct{} {
+	cache := s.committedRowIDsByIdentifier[key]
+	if cache == nil || len(cache.set) == 0 {
+		return nil
+	}
+	copied := make(map[string]struct{}, len(cache.set))
+	for rowID := range cache.set {
+		copied[rowID] = struct{}{}
+	}
+	return copied
+}
+
+func (s *sink) rememberCommittedRowIDs(key string, rowIDs []string) {
+	if len(rowIDs) == 0 {
+		return
+	}
+	cache := s.committedRowIDsByIdentifier[key]
+	if cache == nil {
+		cache = &committedRowIDCache{set: make(map[string]struct{}, len(rowIDs))}
+		s.committedRowIDsByIdentifier[key] = cache
+	}
+	for _, rowID := range rowIDs {
+		if rowID == "" {
+			continue
+		}
+		if _, ok := cache.set[rowID]; ok {
+			continue
+		}
+		cache.set[rowID] = struct{}{}
+		cache.order = append(cache.order, rowID)
+	}
+	if extra := len(cache.order) - maxCommittedRowIDCache; extra > 0 {
+		for _, rowID := range cache.order[:extra] {
+			delete(cache.set, rowID)
+		}
+		cache.order = append([]string(nil), cache.order[extra:]...)
+	}
+}
+
 func allBatchesCommitted(ctx context.Context, writer appendWriter, identifier []string, batchIDs []string) (bool, error) {
-	committedBatches, err := writer.CommittedBatches(ctx, identifier)
+	committedBatches, err := writer.CommittedBatches(ctx, identifier, batchIDs)
 	if err != nil {
 		return false, errors.Trace(err)
 	}
