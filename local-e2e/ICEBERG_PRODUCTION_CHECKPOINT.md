@@ -32,6 +32,12 @@ matrix.
   `<staging-dir>/<base64(changefeed)>/.committed/<base64(target)>/*.commit`.
   The ledger is written and synced before staged files are deleted, and snapshot
   summary hits backfill missing ledger entries.
+- The replay hot path does not scan every retained ledger marker. It looks up
+  only the candidate staged batch IDs currently being drained, so ledger lookup
+  cost is bounded by replay backlog rather than total retention history. The
+  `ticdc_sink_iceberg_committed_ledger_entries` gauge is updated incrementally
+  for markers written by the running TiCDC process instead of walking the ledger
+  tree on every metrics refresh.
 - The ledger removes snapshot-expiration-only replay risk when the shared staging
   directory is retained. The remaining runbook guard is: do not purge staged
   files or `.committed` ledger markers before the maximum replay horizon, and do
@@ -60,7 +66,7 @@ matrix.
     expiration dedupe, ledger-before-delete ordering, staged byte/backend
     metrics, committed row metrics, and ledger write/lookup metrics.
 - Replay/crash reruns:
-  - `S03_REPLAY_PASS cf=s03-replay-1778393646 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S03_REPLAY_PASS cf=s03-replay-1778395364 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
   - `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0`
@@ -104,8 +110,13 @@ matrix.
   many-changefeed-to-one-target must become supported. Until then, keep the
   warehouse owner marker as a hard rejection.
 - Add alert rules, dashboard panels, and a runbook on top of the new metrics.
-  Still missing explicit catalog retry counters and table-creation/schema-failure
-  counters.
+  The minimum alerts for this PR are non-zero
+  `ticdc_sink_iceberg_committed_ledger_writes_total{result="error"}`,
+  non-zero `ticdc_sink_iceberg_committed_ledger_lookups_total{result="error"}`,
+  stale or growing staged backlog age/bytes, and retention-policy drift where
+  Iceberg snapshots, staged JSON files, or `.committed` markers are purged before
+  the maximum replay horizon. Still missing explicit catalog retry counters and
+  table-creation/schema-failure counters.
 - Extend MinIO/S3-style integration coverage beyond the owner marker to include
   credential/auth failure modes, remote orphan cleanup, and eventually
   remote/native data-file staging. The current S3 support is the warehouse path

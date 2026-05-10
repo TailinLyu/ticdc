@@ -215,39 +215,40 @@ func (s *stageStore) MarkBatchesCommitted(
 	batchIDs []string,
 	maxCommitTs uint64,
 	rowCount int,
-) error {
+) (int, error) {
 	if len(batchIDs) == 0 {
-		return nil
+		return 0, nil
 	}
 	if s.root == "" {
-		return errors.New("iceberg staging dir is empty")
+		return 0, errors.New("iceberg staging dir is empty")
 	}
 	if changefeed == "" {
-		return errors.New("iceberg changefeed is empty")
+		return 0, errors.New("iceberg changefeed is empty")
 	}
 	if len(identifier) == 0 {
-		return errors.New("iceberg target identifier is empty")
+		return 0, errors.New("iceberg target identifier is empty")
 	}
 	if err := ctx.Err(); err != nil {
-		return errors.Trace(err)
+		return 0, errors.Trace(err)
 	}
 
 	dir := committedBatchLedgerDir(s.root, changefeed, identifier)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return errors.Trace(err)
+		return 0, errors.Trace(err)
 	}
+	created := 0
 	for _, batchID := range batchIDs {
 		if batchID == "" {
-			return errors.New("iceberg committed ledger batch id is empty")
+			return 0, errors.New("iceberg committed ledger batch id is empty")
 		}
 		if err := ctx.Err(); err != nil {
-			return errors.Trace(err)
+			return 0, errors.Trace(err)
 		}
 		finalName := committedBatchLedgerPath(s.root, changefeed, identifier, batchID)
 		if _, err := os.Stat(finalName); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
-			return errors.Trace(err)
+			return 0, errors.Trace(err)
 		}
 
 		record := committedBatchRecord{
@@ -259,16 +260,18 @@ func (s *stageStore) MarkBatchesCommitted(
 			CreatedAt:   time.Now().UTC(),
 		}
 		if err := writeCommittedBatchRecord(dir, finalName, record); err != nil {
-			return errors.Trace(err)
+			return 0, errors.Trace(err)
 		}
+		created++
 	}
-	return nil
+	return created, nil
 }
 
-func (s *stageStore) CommittedBatches(
+func (s *stageStore) CommittedBatchesForCandidates(
 	ctx context.Context,
 	changefeed string,
 	identifier []string,
+	batchIDs []string,
 ) (map[string]struct{}, error) {
 	if s.root == "" {
 		return nil, errors.New("iceberg staging dir is empty")
@@ -283,76 +286,31 @@ func (s *stageStore) CommittedBatches(
 		return nil, errors.Trace(err)
 	}
 
-	root := committedBatchLedgerDir(s.root, changefeed, identifier)
-	if _, err := os.Stat(root); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	committed := make(map[string]struct{}, len(batchIDs))
+	for _, batchID := range batchIDs {
+		if batchID == "" {
+			return nil, errors.New("iceberg committed ledger batch id is empty")
 		}
-		return nil, errors.Trace(err)
-	}
-
-	committed := make(map[string]struct{})
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Trace(err)
+		}
+		path := committedBatchLedgerPath(s.root, changefeed, identifier, batchID)
+		if _, err := os.Stat(path); err != nil {
 			if os.IsNotExist(err) {
-				return nil
+				continue
 			}
-			return err
-		}
-		if d == nil || d.IsDir() || filepath.Ext(path) != ".commit" {
-			return nil
+			return nil, errors.Trace(err)
 		}
 		record, err := readCommittedBatchRecord(path)
 		if err != nil {
-			return err
+			return nil, errors.Trace(err)
 		}
-		if record.BatchID != "" {
-			committed[record.BatchID] = struct{}{}
+		if record.BatchID != batchID {
+			return nil, errors.Errorf("iceberg committed ledger batch id mismatch: path=%s record=%s", batchID, record.BatchID)
 		}
-		return ctx.Err()
-	})
-	if err != nil {
-		return nil, errors.Trace(err)
+		committed[batchID] = struct{}{}
 	}
 	return committed, nil
-}
-
-func (s *stageStore) CommittedBatchCount(ctx context.Context, changefeed string) (int, error) {
-	if s.root == "" {
-		return 0, errors.New("iceberg staging dir is empty")
-	}
-	if changefeed == "" {
-		return 0, errors.New("iceberg changefeed is empty")
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, errors.Trace(err)
-	}
-
-	root := filepath.Join(s.root, pathSegment(changefeed), ".committed")
-	if _, err := os.Stat(root); err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, errors.Trace(err)
-	}
-
-	count := 0
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		if d != nil && !d.IsDir() && filepath.Ext(path) == ".commit" {
-			count++
-		}
-		return ctx.Err()
-	})
-	if err != nil {
-		return 0, errors.Trace(err)
-	}
-	return count, nil
 }
 
 func (s *stageStore) Delete(path string) error {

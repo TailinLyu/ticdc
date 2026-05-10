@@ -399,7 +399,18 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			}
 			committedByIdentifier[key] = committedBatches
 		}
-		if _, committed := committedBatches[staged.batch.BatchID]; committed {
+		committed, err := s.committedBatch(ctx, committedBatches, staged.batch.Identifier, staged.batch.BatchID)
+		if err != nil {
+			s.recordAppendFailure("committed_batch_lookup")
+			log.Warn("iceberg committer will retry after committed batch lookup failure",
+				zap.String("changefeed", s.changefeedID.String()),
+				zap.Strings("identifier", staged.batch.Identifier),
+				zap.String("batchID", staged.batch.BatchID),
+				zap.Error(err))
+			s.resetWriter()
+			return nil
+		}
+		if committed {
 			rememberRowIDs(seenRowIDs, rowIDs)
 			if err := s.markBatchesCommitted(ctx, staged.batch.Identifier, []string{staged.batch.BatchID}, staged.batch.MaxCommitTs, len(staged.batch.Rows)); err != nil {
 				return errors.Trace(err)
@@ -555,22 +566,32 @@ func (s *sink) committedBatches(ctx context.Context, writer appendWriter, identi
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	ledgerBatches, err := s.stage.CommittedBatches(ctx, s.changefeedID.String(), identifier)
+	if committedBatches == nil {
+		committedBatches = make(map[string]struct{})
+	}
+	return committedBatches, nil
+}
+
+func (s *sink) committedBatch(
+	ctx context.Context,
+	committedBatches map[string]struct{},
+	identifier []string,
+	batchID string,
+) (bool, error) {
+	if _, committed := committedBatches[batchID]; committed {
+		return true, nil
+	}
+	ledgerBatches, err := s.stage.CommittedBatchesForCandidates(ctx, s.changefeedID.String(), identifier, []string{batchID})
 	if err != nil {
 		s.recordCommittedLedgerLookup("error")
-		return nil, errors.Trace(err)
+		return false, errors.Trace(err)
 	}
 	s.recordCommittedLedgerLookup("success")
 	if len(ledgerBatches) == 0 {
-		return committedBatches, nil
+		return false, nil
 	}
-	if committedBatches == nil {
-		committedBatches = make(map[string]struct{}, len(ledgerBatches))
-	}
-	for batchID := range ledgerBatches {
-		committedBatches[batchID] = struct{}{}
-	}
-	return committedBatches, nil
+	committedBatches[batchID] = struct{}{}
+	return true, nil
 }
 
 func (s *sink) markBatchesCommitted(
@@ -580,15 +601,15 @@ func (s *sink) markBatchesCommitted(
 	maxCommitTs uint64,
 	rowCount int,
 ) error {
-	if err := s.stage.MarkBatchesCommitted(ctx, s.changefeedID.String(), identifier, batchIDs, maxCommitTs, rowCount); err != nil {
+	created, err := s.stage.MarkBatchesCommitted(ctx, s.changefeedID.String(), identifier, batchIDs, maxCommitTs, rowCount)
+	if err != nil {
 		s.recordCommittedLedgerWrite("error")
 		return errors.Trace(err)
 	}
 	s.recordCommittedLedgerWrite("success")
-	if err := s.refreshCommittedLedgerMetrics(ctx); err != nil {
-		log.Warn("failed to refresh iceberg committed ledger metrics",
-			zap.String("changefeed", s.changefeedID.String()),
-			zap.Error(err))
+	if created > 0 {
+		metrics.IcebergCommittedLedgerEntriesGauge.WithLabelValues(
+			s.changefeedID.Keyspace(), s.changefeedID.Name()).Add(float64(created))
 	}
 	return nil
 }
@@ -656,9 +677,6 @@ func (s *sink) refreshStageMetrics(ctx context.Context, checkpointTs uint64) err
 		return errors.Trace(err)
 	}
 	s.recordStageMetrics(stagedFiles, eligibleStagedFiles(stagedFiles, checkpointTs))
-	if err := s.refreshCommittedLedgerMetrics(ctx); err != nil {
-		return errors.Trace(err)
-	}
 	return nil
 }
 
@@ -673,16 +691,6 @@ func (s *sink) recordTargetOwnerConflict(err error) {
 func (s *sink) recordCommitDuration(result string, duration time.Duration) {
 	metrics.IcebergCommitDurationHistogram.WithLabelValues(
 		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Observe(duration.Seconds())
-}
-
-func (s *sink) refreshCommittedLedgerMetrics(ctx context.Context) error {
-	count, err := s.stage.CommittedBatchCount(ctx, s.changefeedID.String())
-	if err != nil {
-		return errors.Trace(err)
-	}
-	metrics.IcebergCommittedLedgerEntriesGauge.WithLabelValues(
-		s.changefeedID.Keyspace(), s.changefeedID.Name()).Set(float64(count))
-	return nil
 }
 
 func (s *sink) recordCommitSuccess(batchCount int, rowCount int, checkpointTs uint64, maxCommitTs uint64) {

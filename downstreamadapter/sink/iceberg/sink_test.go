@@ -435,7 +435,8 @@ func TestCommitterSkipsLedgerCommittedBatchAfterSnapshotHistoryExpires(t *testin
 	files, err := stage.List(ctx, changefeedID.String())
 	require.NoError(t, err)
 	require.Len(t, files, 1)
-	require.NoError(t, stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{files[0].batch.BatchID}, 10, 1))
+	_, err = stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{files[0].batch.BatchID}, 10, 1)
+	require.NoError(t, err)
 
 	s := newSink(ctx, changefeedID, cfg, writer)
 	s.SetTableSchemaStore(nil)
@@ -754,7 +755,7 @@ func TestCommitterWritesDurableLedgerBeforeDeletingStageFile(t *testing.T) {
 	require.Len(t, writer.getCalls(), 1)
 	require.Zero(t, stageFileCount(t, cfg.StagingDir))
 
-	ledger, err := stage.CommittedBatches(ctx, changefeedID.String(), identifier)
+	ledger, err := stage.CommittedBatchesForCandidates(ctx, changefeedID.String(), identifier, []string{batchID})
 	require.NoError(t, err)
 	require.Contains(t, ledger, batchID)
 }
@@ -770,7 +771,9 @@ func TestStageListSkipsCommittedLedgerSubtree(t *testing.T) {
 	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
 		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
 	}, 10))
-	require.NoError(t, stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{"already-committed"}, 10, 1))
+	created, err := stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{"already-committed"}, 10, 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, created)
 	require.NoError(t, os.WriteFile(
 		filepath.Join(committedBatchLedgerDir(cfg.StagingDir, changefeedID.String(), identifier), "not-a-stage-file.json"),
 		[]byte("{"),
@@ -779,6 +782,31 @@ func TestStageListSkipsCommittedLedgerSubtree(t *testing.T) {
 	files, err := stage.List(ctx, changefeedID.String())
 	require.NoError(t, err)
 	require.Len(t, files, 1)
+}
+
+func TestStageCommittedBatchesUsesCandidateLookup(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+
+	created, err := stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{"batch-a"}, 10, 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, created)
+	created, err = stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{"batch-a"}, 10, 1)
+	require.NoError(t, err)
+	require.Zero(t, created)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(committedBatchLedgerDir(cfg.StagingDir, changefeedID.String(), identifier), "corrupt-unrequested.commit"),
+		[]byte("{"),
+		0o644))
+
+	ledger, err := stage.CommittedBatchesForCandidates(ctx, changefeedID.String(), identifier, []string{"batch-a", "missing"})
+	require.NoError(t, err)
+	require.Contains(t, ledger, "batch-a")
+	require.NotContains(t, ledger, "missing")
 }
 
 func TestCommitterRetriesAppendFailureWithoutStopping(t *testing.T) {

@@ -213,8 +213,9 @@ Remaining intentional limitations:
 - Replay dedupe now uses both Iceberg snapshot summaries and a durable committed
   ledger under `.committed` in the shared staging directory. Operators must retain
   staged files and committed ledger markers for at least the maximum replay
-  horizon; native Iceberg data-file committables remain the target production
-  design.
+  horizon. Ledger lookup is candidate-bounded by staged batch IDs being drained,
+  not by total retained marker history; native Iceberg data-file committables
+  remain the target production design.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
   `run_s17_schema_unsupported.sh` and
   `run_s17_create_table_unsupported.sh` verify that live DDL is rejected
@@ -255,6 +256,20 @@ ticdc_sink_iceberg_append_failures_total
 ticdc_sink_iceberg_cleanup_failures_total
 ticdc_sink_iceberg_target_owner_conflicts_total
 ```
+
+Minimum local alert guardrails for the current v1 contract:
+
+```bash
+increase(ticdc_sink_iceberg_committed_ledger_writes_total{result="error"}[5m]) > 0
+increase(ticdc_sink_iceberg_committed_ledger_lookups_total{result="error"}[5m]) > 0
+ticdc_sink_iceberg_staged_oldest_age_seconds{state="pending"} > <max_expected_drain_seconds>
+ticdc_sink_iceberg_staged_bytes{state="pending"} > <max_expected_backlog_bytes>
+```
+
+The retention runbook must keep Iceberg snapshots, staged JSON files, and
+`.committed` ledger markers for at least the maximum TiCDC replay horizon. If
+ledger writes fail after Iceberg append, retained snapshots are still the
+fallback until the ledger marker is written on retry.
 
 The fresh replay/hardening scripts can be rerun with:
 

@@ -156,7 +156,7 @@ var (
 			Namespace: "ticdc",
 			Subsystem: "sink",
 			Name:      "iceberg_committed_ledger_entries",
-			Help:      "Number of durable committed-batch ledger entries for a changefeed.",
+			Help:      "Number of durable committed-batch ledger entries written by this TiCDC process for a changefeed.",
 		}, []string{getKeyspaceLabel(), "changefeed"})
 
 	IcebergCommittedLedgerWritesCounter = prometheus.NewCounterVec(
