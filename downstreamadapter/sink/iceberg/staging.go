@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,6 +71,14 @@ type committedRowSegmentRecord struct {
 	RowIDs      []string  `json:"row_ids"`
 	MaxCommitTs uint64    `json:"max_commit_ts"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type committedRowIndexRecord struct {
+	Changefeed string    `json:"changefeed"`
+	Identifier []string  `json:"identifier"`
+	Shard      string    `json:"shard"`
+	RowHashes  []string  `json:"row_hashes"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type stageStore struct {
@@ -171,7 +180,7 @@ func (s *stageStore) List(ctx context.Context, changefeed string) ([]stagedFile,
 			}
 			return err
 		}
-		if d != nil && d.IsDir() && (d.Name() == ".committed" || d.Name() == ".committed-rows") {
+		if d != nil && d.IsDir() && (d.Name() == ".committed" || d.Name() == ".committed-rows" || d.Name() == ".committed-row-index") {
 			return filepath.SkipDir
 		}
 		if d == nil || d.IsDir() || filepath.Ext(path) != ".json" {
@@ -330,23 +339,41 @@ func (s *stageStore) MarkRowsCommitted(
 		return 0, errors.Trace(err)
 	}
 
-	buckets := make(map[string][]string)
-	seen := make(map[string]struct{}, len(rowIDs))
+	indexes := make(map[string]map[string]struct{})
+	changedIndexes := make(map[string]struct{})
+	newRowsByBucket := make(map[string][]string)
+	seenRows := make(map[string]struct{}, len(rowIDs))
 	for _, rowID := range rowIDs {
 		if rowID == "" {
 			return 0, errors.New("iceberg committed row id is empty")
 		}
-		if _, ok := seen[rowID]; ok {
+		if _, ok := seenRows[rowID]; ok {
 			continue
 		}
-		seen[rowID] = struct{}{}
-		bucket := committedRowLedgerBucket(rowID)
-		buckets[bucket] = append(buckets[bucket], rowID)
+		seenRows[rowID] = struct{}{}
+		shard := committedRowIndexShard(rowID)
+		index := indexes[shard]
+		if index == nil {
+			var err error
+			index, _, err = s.readCommittedRowIndex(changefeed, identifier, shard)
+			if err != nil {
+				return 0, errors.Trace(err)
+			}
+			indexes[shard] = index
+		}
+		rowHash := committedRowHash(rowID)
+		if _, ok := index[rowHash]; ok {
+			continue
+		}
+		index[rowHash] = struct{}{}
+		changedIndexes[shard] = struct{}{}
+		bucket := committedRowLedgerBucketFromHash(rowHash)
+		newRowsByBucket[bucket] = append(newRowsByBucket[bucket], rowID)
 	}
 
 	createdRows := 0
 	createdAt := time.Now().UTC()
-	for bucket, bucketRowIDs := range buckets {
+	for bucket, bucketRowIDs := range newRowsByBucket {
 		if err := ctx.Err(); err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -376,6 +403,17 @@ func (s *stageStore) MarkRowsCommitted(
 		}
 		createdRows += len(bucketRowIDs)
 	}
+	for shard, index := range indexes {
+		if _, ok := changedIndexes[shard]; !ok {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, errors.Trace(err)
+		}
+		if err := s.writeCommittedRowIndex(changefeed, identifier, shard, index, createdAt); err != nil {
+			return 0, errors.Trace(err)
+		}
+	}
 	return createdRows, nil
 }
 
@@ -399,59 +437,163 @@ func (s *stageStore) CommittedRowIDsForCandidates(
 	}
 
 	committed := make(map[string]struct{}, len(rowIDs))
-	neededByBucket := make(map[string]map[string]struct{})
+	neededByShard := make(map[string]map[string]string)
 	for _, rowID := range rowIDs {
 		if rowID == "" {
 			return nil, errors.New("iceberg committed row id is empty")
 		}
-		bucket := committedRowLedgerBucket(rowID)
-		needed := neededByBucket[bucket]
+		shard := committedRowIndexShard(rowID)
+		needed := neededByShard[shard]
 		if needed == nil {
-			needed = make(map[string]struct{})
-			neededByBucket[bucket] = needed
+			needed = make(map[string]string)
+			neededByShard[shard] = needed
 		}
-		needed[rowID] = struct{}{}
+		needed[committedRowHash(rowID)] = rowID
 	}
 
-	for bucket, needed := range neededByBucket {
-		if err := ctx.Err(); err != nil {
-			return nil, errors.Trace(err)
-		}
-		dir := committedRowSegmentLedgerDir(s.root, changefeed, identifier, bucket)
-		entries, err := os.ReadDir(dir)
+	reconciledIndexes := false
+	for shard, needed := range neededByShard {
+		index, exists, err := s.readCommittedRowIndex(changefeed, identifier, shard)
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
 			return nil, errors.Trace(err)
 		}
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].Name() > entries[j].Name()
-		})
-		for _, entry := range entries {
-			if len(needed) == 0 {
-				break
+		if !exists && !reconciledIndexes {
+			indexDir := committedRowIndexDir(s.root, changefeed, identifier)
+			if _, err := os.Stat(indexDir); err == nil {
+				// The target is already using row indexes; an absent shard simply
+				// means no retained rows hash into it.
+				exists = true
+			} else if !os.IsNotExist(err) {
+				return nil, errors.Trace(err)
 			}
-			if entry.IsDir() || filepath.Ext(entry.Name()) != ".rows" {
-				continue
+		}
+		if !exists && !reconciledIndexes {
+			if err := s.rebuildCommittedRowIndexes(ctx, changefeed, identifier); err != nil {
+				return nil, errors.Trace(err)
 			}
-			record, err := readCommittedRowSegmentRecord(filepath.Join(dir, entry.Name()))
+			reconciledIndexes = true
+			index, _, err = s.readCommittedRowIndex(changefeed, identifier, shard)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
-			if record.Bucket != bucket {
-				return nil, errors.Errorf("iceberg committed row ledger bucket mismatch: path=%s record=%s", bucket, record.Bucket)
-			}
-			for _, rowID := range record.RowIDs {
-				if _, ok := needed[rowID]; !ok {
-					continue
-				}
+		}
+		for rowHash, rowID := range needed {
+			if _, ok := index[rowHash]; ok {
 				committed[rowID] = struct{}{}
-				delete(needed, rowID)
 			}
 		}
 	}
 	return committed, nil
+}
+
+func (s *stageStore) readCommittedRowIndex(
+	changefeed string,
+	identifier []string,
+	shard string,
+) (map[string]struct{}, bool, error) {
+	path := committedRowIndexPath(s.root, changefeed, identifier, shard)
+	record, err := readCommittedRowIndexRecord(path)
+	if err != nil {
+		if os.IsNotExist(errors.Cause(err)) || os.IsNotExist(err) {
+			return make(map[string]struct{}), false, nil
+		}
+		return nil, false, errors.Trace(err)
+	}
+	if record.Shard != shard {
+		return nil, false, errors.Errorf("iceberg committed row index shard mismatch: path=%s record=%s", shard, record.Shard)
+	}
+	index := make(map[string]struct{}, len(record.RowHashes))
+	for _, rowHash := range record.RowHashes {
+		if rowHash == "" {
+			return nil, false, errors.New("iceberg committed row index hash is empty")
+		}
+		index[rowHash] = struct{}{}
+	}
+	return index, true, nil
+}
+
+func (s *stageStore) writeCommittedRowIndex(
+	changefeed string,
+	identifier []string,
+	shard string,
+	index map[string]struct{},
+	updatedAt time.Time,
+) error {
+	finalName := committedRowIndexPath(s.root, changefeed, identifier, shard)
+	dir := filepath.Dir(finalName)
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
+		return errors.Trace(err)
+	}
+	record := committedRowIndexRecord{
+		Changefeed: changefeed,
+		Identifier: append([]string(nil), identifier...),
+		Shard:      shard,
+		RowHashes:  sortedMapKeys(index),
+		UpdatedAt:  updatedAt,
+	}
+	return writeCommittedRowIndexRecord(dir, finalName, record)
+}
+
+func (s *stageStore) rebuildCommittedRowIndexes(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+) error {
+	root := committedRowLedgerDir(s.root, changefeed, identifier)
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return errors.Trace(err)
+	}
+
+	indexes := make(map[string]map[string]struct{})
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Trace(err)
+		}
+		if d == nil || d.IsDir() || filepath.Ext(path) != ".rows" {
+			return nil
+		}
+		bucket := filepath.Base(filepath.Dir(path))
+		record, err := readCommittedRowSegmentRecord(path)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if record.Bucket != bucket {
+			return errors.Errorf("iceberg committed row ledger bucket mismatch: path=%s record=%s", bucket, record.Bucket)
+		}
+		for _, rowID := range record.RowIDs {
+			if rowID == "" {
+				return errors.New("iceberg committed row id is empty")
+			}
+			shard := committedRowIndexShard(rowID)
+			index := indexes[shard]
+			if index == nil {
+				index = make(map[string]struct{})
+				indexes[shard] = index
+			}
+			index[committedRowHash(rowID)] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	updatedAt := time.Now().UTC()
+	for shard, index := range indexes {
+		if err := ctx.Err(); err != nil {
+			return errors.Trace(err)
+		}
+		if err := s.writeCommittedRowIndex(changefeed, identifier, shard, index, updatedAt); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
 }
 
 func (s *stageStore) Delete(path string) error {
@@ -604,12 +746,34 @@ func readCommittedRowSegmentRecord(path string) (committedRowSegmentRecord, erro
 	return record, nil
 }
 
+func readCommittedRowIndexRecord(path string) (committedRowIndexRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return committedRowIndexRecord{}, errors.Trace(err)
+	}
+	defer file.Close()
+
+	var record committedRowIndexRecord
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&record); err != nil {
+		return committedRowIndexRecord{}, errors.Trace(err)
+	}
+	if record.Shard == "" {
+		return committedRowIndexRecord{}, errors.New("iceberg committed row index shard is empty")
+	}
+	return record, nil
+}
+
 func writeCommittedBatchRecord(dir string, finalName string, record committedBatchRecord) error {
 	return writeJSONFileAtomically(dir, ".ledger-*.tmp", finalName, &record)
 }
 
 func writeCommittedRowSegmentRecord(dir string, finalName string, record committedRowSegmentRecord) error {
 	return writeJSONFileAtomically(dir, ".row-ledger-*.tmp", finalName, &record)
+}
+
+func writeCommittedRowIndexRecord(dir string, finalName string, record committedRowIndexRecord) error {
+	return writeJSONFileAtomically(dir, ".row-index-*.tmp", finalName, &record)
 }
 
 func writeJSONFileAtomically(dir string, tmpPattern string, finalName string, value any) error {
@@ -701,6 +865,7 @@ func syncDirectory(path string) error {
 const (
 	stagingRowIDField             = "_ticdc_iceberg_row_id"
 	committedRowLedgerBucketCount = 16
+	committedRowIndexShardCount   = 256
 )
 
 func prepareStagedRows(identifier []string, rows []map[string]any) ([]map[string]any, []string, error) {
@@ -787,13 +952,33 @@ func committedRowLedgerDir(root string, changefeed string, identifier []string) 
 	return filepath.Join(root, pathSegment(changefeed), ".committed-rows", pathSegment(identifierKey(identifier)))
 }
 
+func committedRowIndexDir(root string, changefeed string, identifier []string) string {
+	return filepath.Join(root, pathSegment(changefeed), ".committed-row-index", pathSegment(identifierKey(identifier)))
+}
+
 func committedRowSegmentLedgerDir(root string, changefeed string, identifier []string, bucket string) string {
 	return filepath.Join(committedRowLedgerDir(root, changefeed, identifier), bucket)
 }
 
-func committedRowLedgerBucket(rowID string) string {
+func committedRowHash(rowID string) string {
 	sum := sha256.Sum256([]byte(rowID))
-	return hex.EncodeToString(sum[:])[:1]
+	return hex.EncodeToString(sum[:])
+}
+
+func committedRowLedgerBucket(rowID string) string {
+	return committedRowLedgerBucketFromHash(committedRowHash(rowID))
+}
+
+func committedRowLedgerBucketFromHash(rowHash string) string {
+	return rowHash[:1]
+}
+
+func committedRowIndexShard(rowID string) string {
+	return committedRowHash(rowID)[:2]
+}
+
+func committedRowIndexPath(root string, changefeed string, identifier []string, shard string) string {
+	return filepath.Join(committedRowIndexDir(root, changefeed, identifier), shard+".index")
 }
 
 func committedRowSegmentLedgerPath(
@@ -828,6 +1013,15 @@ func sortedStringsCopy(values []string) []string {
 	copied := append([]string(nil), values...)
 	sort.Strings(copied)
 	return copied
+}
+
+func sortedMapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for value := range values {
+		keys = append(keys, value)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func stagedBatchID(identifier []string, rows []map[string]any, rowIDs []string, maxCommitTs uint64) (string, error) {

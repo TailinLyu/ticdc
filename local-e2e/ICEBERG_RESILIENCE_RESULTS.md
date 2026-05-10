@@ -60,8 +60,8 @@ stable across replayed keyed rows even when TiCDC omits raw `RowKey` bytes.
 
 | ID | Scenario | Status | Fresh evidence | Notes |
 | --- | --- | --- | --- | --- |
-| S03 | Committer exits after Iceberg append but before staged-file delete | PASS | `S03_REPLAY_PASS cf=s03-replay-1778402711 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s03_append_exit_replay.sh`. A smaller rerun exposed a six-row duplicate when target ownership was claimed after staging; the final pass verifies the claim now happens before the stage file is visible. The latest code also adds shared-staging committed-batch and committed-row ledgers, so retained or replayed stage files are not deduped only by Iceberg snapshot summaries or whole-batch IDs. |
-| S05 | Non-committer exits after staging but before `PostFlush` | PASS | `S05_REPLAY_PASS cf=s05-replay-1778402664 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s05_stage_exit_replay.sh`. This rerun used the durable committed row-ID ledger path for delayed source replay after a staged file can be cleaned up. |
+| S03 | Committer exits after Iceberg append but before staged-file delete | PASS | `S03_REPLAY_PASS cf=s03-replay-1778404206 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s03_append_exit_replay.sh`. A smaller rerun exposed a six-row duplicate when target ownership was claimed after staging; the final pass verifies the claim now happens before the stage file is visible. The latest code also adds shared-staging committed-batch and committed-row ledgers plus sharded row-hash indexes, so retained or replayed stage files are not deduped only by Iceberg snapshot summaries or whole-batch IDs. |
+| S05 | Non-committer exits after staging but before `PostFlush` | PASS | `S05_REPLAY_PASS cf=s05-replay-1778404161 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s05_stage_exit_replay.sh`. This rerun used the durable committed row-ID ledger and row-index path for delayed source replay after a staged file can be cleaned up. |
 | S09 | Iceberg REST outage while staged files exist, then recovery | PASS | `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0` | REST was stopped, staged files accumulated, REST was restarted, and TiCDC drained without a TiCDC restart. |
 | S11 | Staged-file delete failure after successful append | PASS | `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s11_append_error_replay.sh`. |
 | S12 | High-volume staged-batch drain | PASS | `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0` | Reran at the prior high-volume size; local REST catalog drained fully. |
@@ -98,13 +98,15 @@ for the target, durable handled markers for duplicate-only replay batches, and
 a focused restart regression. A subsequent reviewer delayed-replay regression
 then showed the later overlapping batch can arrive after earlier staged evidence
 was already cleaned up; the committer now writes sharded durable committed
-row-ID segments before cleanup and probes only candidate row-ID buckets on
-replay.
+row-ID segments plus sharded exact row-hash indexes before cleanup and probes
+only current candidate row-index shards on replay, so all-new replay misses do
+not decode retained row segments. Segment-only ledgers from older local builds
+are reconciled into row indexes on first lookup.
 
 Fresh local e2e reruns after the ledger and metrics patch:
 
-- `S03_REPLAY_PASS cf=s03-replay-1778402711 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
-- `S05_REPLAY_PASS cf=s05-replay-1778402664 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+- `S03_REPLAY_PASS cf=s03-replay-1778404206 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+- `S05_REPLAY_PASS cf=s05-replay-1778404161 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
 - Earlier Prometheus scrape after S05 included
   `ticdc_sink_iceberg_commit_duration_seconds`,
   `ticdc_sink_iceberg_committed_batches_total`,

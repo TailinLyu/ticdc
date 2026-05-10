@@ -24,8 +24,8 @@ Full evidence is in `local-e2e/ICEBERG_RESILIENCE_RESULTS.md`.
 
 | ID | Status | Fresh local evidence | Fix / interpretation |
 | --- | --- | --- | --- |
-| S03 | PASS | `S03_REPLAY_PASS cf=s03-replay-1778402711 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Retained staged files are skipped by committed batch IDs from Iceberg snapshots plus the durable shared-staging batch ledger; replayed keyed rows use stable table-key row IDs; target ownership is claimed before the stage file is exposed; staged evidence is retained across committer restart until later staged files for the same target become eligible; duplicate-only replay batches are durably marked handled before cleanup; and delayed partial-overlap replay is deduped by durable committed row-ID segments. |
-| S05 | PASS | `S05_REPLAY_PASS cf=s05-replay-1778402664 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Durable stage plus unacked upstream replay no longer duplicates rows; focused metrics tests cover commit duration, committed row, committed batch, and batch/row ledger write/lookup metrics. |
+| S03 | PASS | `S03_REPLAY_PASS cf=s03-replay-1778404206 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Retained staged files are skipped by committed batch IDs from Iceberg snapshots plus the durable shared-staging batch ledger; replayed keyed rows use stable table-key row IDs; target ownership is claimed before the stage file is exposed; staged evidence is retained across committer restart until later staged files for the same target become eligible; duplicate-only replay batches are durably marked handled before cleanup; and delayed partial-overlap replay is deduped by durable committed row-ID segments plus sharded exact row-hash indexes. |
+| S05 | PASS | `S05_REPLAY_PASS cf=s05-replay-1778404161 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Durable stage plus unacked upstream replay no longer duplicates rows; focused metrics tests cover commit duration, committed row, committed batch, and batch/row ledger write/lookup metrics. |
 | S09 | PASS | `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0` | Catalog recovery now drains automatically after REST returns; no TiCDC restart required in the local replay. |
 | S11 | PASS | `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0` | Append succeeded but cleanup failed is idempotent on retry. |
 | S12 | PASS | `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0` | The local high-volume drain now completes exactly at the prior stress size. |
@@ -36,13 +36,14 @@ Full evidence is in `local-e2e/ICEBERG_RESILIENCE_RESULTS.md`.
 
 The remaining design compromise is bounded JSON row staging. The current replay
 dedupe story no longer depends only on Iceberg snapshot summaries because the
-committer also writes durable `.committed` batch markers and `.committed-rows`
-row-ID segment markers in the shared staging directory before deleting staged
-files.
+committer also writes durable `.committed` batch markers, `.committed-rows`
+row-ID segment markers, and `.committed-row-index` row-hash indexes in the
+shared staging directory before deleting staged files.
 Staged JSON files are published with temp write, file fsync, close, atomic
 rename, and parent directory fsync before upstream progress is acknowledged.
 Ledger lookup checks only candidate staged batch IDs by marker path and only the
-sharded row-ID segment buckets for current candidate rows. Iceberg
+row-index shards touched by current candidate rows. Segment-only row ledgers
+from older builds are reconciled into the row index on first lookup. Iceberg
 snapshot-summary dedupe scans newest-first and stops once those batch candidates
 are found. Partial-overlap replay is restart-safe even when the later
 overlapping replay batch is staged after the earlier stage file has been cleaned

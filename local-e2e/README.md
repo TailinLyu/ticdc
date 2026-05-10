@@ -212,13 +212,17 @@ Remaining intentional limitations:
   shared filesystem or PVC. A staged JSON batch is made visible only after temp
   write, file fsync, close, atomic rename, and parent directory fsync.
 - Replay dedupe now uses Iceberg snapshot summaries, a durable committed-batch
-  ledger under `.committed`, and a durable committed row-ID segment ledger under
-  `.committed-rows` in the shared staging directory. Operators must retain
-  staged files and committed ledger markers for at least the maximum replay
-  horizon. Batch-ledger lookup is direct by current candidate marker path, and
-  row-ledger lookup reads only the sharded segment buckets for current candidate
-  row IDs. Iceberg snapshot-summary dedupe scans newest-first and stops once the
-  current staged batch candidates are found. Partial-overlap replay is
+  ledger under `.committed`, a durable committed row-ID segment ledger under
+  `.committed-rows`, and sharded exact row-hash indexes under
+  `.committed-row-index` in the shared staging directory. Operators must retain
+  staged files and committed ledger/index markers for at least the maximum
+  replay horizon. Batch-ledger lookup is direct by current candidate marker
+  path, and row-ledger lookup reads only the row-index shards touched by current
+  candidate row IDs, so all-new replay misses do not decode retained row
+  segments. A retained segment-only ledger from an older build is reconciled
+  into the sharded row index on first lookup. Iceberg snapshot-summary dedupe
+  scans newest-first and stops once the current staged batch candidates are
+  found. Partial-overlap replay is
   restart-safe even when the overlapping replay batch is staged after the
   earlier stage file has already been cleaned up; duplicate-only replay batches
   are marked handled before cleanup, and the bounded row-ID cache is only an
@@ -280,10 +284,10 @@ ticdc_sink_iceberg_staged_bytes{state="pending"} > <max_expected_backlog_bytes>
 ```
 
 The retention runbook must keep Iceberg snapshots, staged JSON files, and
-`.committed`/`.committed-rows` ledger markers for at least the maximum TiCDC
-replay horizon. If ledger writes fail after Iceberg append, retained snapshots
-and staged files are still the fallback until the ledger markers are written on
-retry.
+`.committed`/`.committed-rows`/`.committed-row-index` markers for at least the
+maximum TiCDC replay horizon. If ledger writes fail after Iceberg append,
+retained snapshots and staged files are still the fallback until the ledger
+markers are written on retry.
 
 The fresh replay/hardening scripts can be rerun with:
 

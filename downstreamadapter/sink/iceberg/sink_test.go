@@ -1080,6 +1080,54 @@ func TestStageCommittedRowIDsUsesCandidateLookup(t *testing.T) {
 	require.NotContains(t, ledger, "missing")
 }
 
+func TestStageCommittedRowIDsDoesNotDecodeRetainedSegmentsForMisses(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	missing := "candidate-new-row"
+	missingShard := committedRowIndexShard(missing)
+
+	for i := 0; i < 200; i++ {
+		rowID := rowIDInIndexShard(fmt.Sprintf("retained-row-%04d", i), missingShard)
+		created, err := stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, []string{rowID}, []string{fmt.Sprintf("batch-%04d", i)}, uint64(i+1))
+		require.NoError(t, err)
+		require.Equal(t, 1, created)
+	}
+	corruptDir := committedRowSegmentLedgerDir(
+		cfg.StagingDir, changefeedID.String(), identifier, committedRowLedgerBucket(missing))
+	require.NoError(t, os.MkdirAll(corruptDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(corruptDir, "corrupt-retained.rows"), []byte("{"), 0o644))
+
+	ledger, err := stage.CommittedRowIDsForCandidates(ctx, changefeedID.String(), identifier, []string{missing})
+	require.NoError(t, err)
+	require.Empty(t, ledger)
+}
+
+func TestStageCommittedRowIDsRebuildsMissingIndexFromRetainedSegments(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+
+	created, err := stage.MarkRowsCommitted(ctx, changefeedID.String(), identifier, []string{"row-a"}, []string{"batch-a"}, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, created)
+	require.NoError(t, os.RemoveAll(committedRowIndexDir(cfg.StagingDir, changefeedID.String(), identifier)))
+
+	ledger, err := stage.CommittedRowIDsForCandidates(ctx, changefeedID.String(), identifier, []string{"row-a", "missing"})
+	require.NoError(t, err)
+	require.Contains(t, ledger, "row-a")
+	require.NotContains(t, ledger, "missing")
+
+	_, err = os.Stat(committedRowIndexPath(cfg.StagingDir, changefeedID.String(), identifier, committedRowIndexShard("row-a")))
+	require.NoError(t, err)
+}
+
 func TestStageCommittedRowIDsBatchesFiveThousandRowsIntoSegments(t *testing.T) {
 	ctx := context.Background()
 
@@ -1096,6 +1144,7 @@ func TestStageCommittedRowIDsBatchesFiveThousandRowsIntoSegments(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, maxRowsPerCommit, created)
 	require.LessOrEqual(t, rowLedgerFileCount(t, cfg.StagingDir), committedRowLedgerBucketCount)
+	require.LessOrEqual(t, rowIndexFileCount(t, cfg.StagingDir), committedRowIndexShardCount)
 
 	ledger, err := stage.CommittedRowIDsForCandidates(ctx, changefeedID.String(), identifier, []string{"row-0000", "row-4999", "missing"})
 	require.NoError(t, err)
@@ -1693,6 +1742,32 @@ func rowLedgerFileCount(t *testing.T, root string) int {
 	})
 	require.NoError(t, err)
 	return count
+}
+
+func rowIndexFileCount(t *testing.T, root string) int {
+	t.Helper()
+	count := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		rel, relErr := filepath.Rel(root, path)
+		require.NoError(t, relErr)
+		if d == nil || d.IsDir() || !strings.Contains(filepath.ToSlash(rel), "/.committed-row-index/") {
+			return nil
+		}
+		count++
+		return nil
+	})
+	require.NoError(t, err)
+	return count
+}
+
+func rowIDInIndexShard(prefix string, shard string) string {
+	for i := 0; ; i++ {
+		rowID := fmt.Sprintf("%s-%06d", prefix, i)
+		if committedRowIndexShard(rowID) == shard {
+			return rowID
+		}
+	}
 }
 
 func newSinkTestInsertEvent(tableInfo *common.TableInfo, commitTs uint64, id int64, name string) *commonEvent.DMLEvent {
