@@ -207,7 +207,14 @@ Remaining intentional limitations:
   leave rows for the committer. This affects S15 and S24.
 - MinIO/S3-compatible coverage exists for the owner marker through
   `run_s16_minio_owner_marker.sh`; staged files are still local/shared-path
-  JSON and need follow-up before S3-native high-throughput staging.
+  JSON and need follow-up before S3-native high-throughput staging. For now,
+  every TiCDC capture must see the same `staging-dir` path, typically through a
+  shared filesystem or PVC.
+- Replay dedupe now uses both Iceberg snapshot summaries and a durable committed
+  ledger under `.committed` in the shared staging directory. Operators must retain
+  staged files and committed ledger markers for at least the maximum replay
+  horizon; native Iceberg data-file committables remain the target production
+  design.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
   `run_s17_schema_unsupported.sh` and
   `run_s17_create_table_unsupported.sh` verify that live DDL is rejected
@@ -225,8 +232,28 @@ data-file committables and a target-level commit protocol.
 Fresh verification used before opening the PR:
 
 ```bash
-go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg \
+go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e \
   ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1
+```
+
+Useful Iceberg sink metric families to inspect during a local run:
+
+```bash
+ticdc_sink_iceberg_staged_files
+ticdc_sink_iceberg_staged_rows
+ticdc_sink_iceberg_staged_bytes
+ticdc_sink_iceberg_staged_oldest_age_seconds
+ticdc_sink_iceberg_commit_duration_seconds
+ticdc_sink_iceberg_committed_batches_total
+ticdc_sink_iceberg_committed_rows_total
+ticdc_sink_iceberg_committed_ledger_entries
+ticdc_sink_iceberg_committed_ledger_writes_total
+ticdc_sink_iceberg_committed_ledger_lookups_total
+ticdc_sink_iceberg_staging_backend_info
+ticdc_sink_iceberg_commit_barrier_lag_tso
+ticdc_sink_iceberg_append_failures_total
+ticdc_sink_iceberg_cleanup_failures_total
+ticdc_sink_iceberg_target_owner_conflicts_total
 ```
 
 The fresh replay/hardening scripts can be rerun with:

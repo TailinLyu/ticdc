@@ -42,14 +42,24 @@ type stagedBatch struct {
 }
 
 type stagedFile struct {
-	path  string
-	batch stagedBatch
+	path      string
+	sizeBytes int64
+	batch     stagedBatch
 }
 
 type targetOwnerRecord struct {
 	Changefeed string    `json:"changefeed"`
 	Identifier []string  `json:"identifier"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+type committedBatchRecord struct {
+	Changefeed  string    `json:"changefeed"`
+	BatchID     string    `json:"batch_id"`
+	Identifier  []string  `json:"identifier"`
+	MaxCommitTs uint64    `json:"max_commit_ts"`
+	RowCount    int       `json:"row_count"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type stageStore struct {
@@ -168,14 +178,21 @@ func (s *stageStore) List(ctx context.Context, changefeed string) ([]stagedFile,
 			}
 			return err
 		}
+		if d != nil && d.IsDir() && d.Name() == ".committed" {
+			return filepath.SkipDir
+		}
 		if d == nil || d.IsDir() || filepath.Ext(path) != ".json" {
 			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
 		}
 		batch, err := readStagedBatch(path)
 		if err != nil {
 			return err
 		}
-		files = append(files, stagedFile{path: path, batch: batch})
+		files = append(files, stagedFile{path: path, sizeBytes: info.Size(), batch: batch})
 		return ctx.Err()
 	})
 	if err != nil {
@@ -189,6 +206,153 @@ func (s *stageStore) List(ctx context.Context, changefeed string) ([]stagedFile,
 		return files[i].path < files[j].path
 	})
 	return files, nil
+}
+
+func (s *stageStore) MarkBatchesCommitted(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	batchIDs []string,
+	maxCommitTs uint64,
+	rowCount int,
+) error {
+	if len(batchIDs) == 0 {
+		return nil
+	}
+	if s.root == "" {
+		return errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Trace(err)
+	}
+
+	dir := committedBatchLedgerDir(s.root, changefeed, identifier)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return errors.Trace(err)
+	}
+	for _, batchID := range batchIDs {
+		if batchID == "" {
+			return errors.New("iceberg committed ledger batch id is empty")
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Trace(err)
+		}
+		finalName := committedBatchLedgerPath(s.root, changefeed, identifier, batchID)
+		if _, err := os.Stat(finalName); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return errors.Trace(err)
+		}
+
+		record := committedBatchRecord{
+			Changefeed:  changefeed,
+			BatchID:     batchID,
+			Identifier:  append([]string(nil), identifier...),
+			MaxCommitTs: maxCommitTs,
+			RowCount:    rowCount,
+			CreatedAt:   time.Now().UTC(),
+		}
+		if err := writeCommittedBatchRecord(dir, finalName, record); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
+}
+
+func (s *stageStore) CommittedBatches(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+) (map[string]struct{}, error) {
+	if s.root == "" {
+		return nil, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return nil, errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return nil, errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	root := committedBatchLedgerDir(s.root, changefeed, identifier)
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errors.Trace(err)
+	}
+
+	committed := make(map[string]struct{})
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d == nil || d.IsDir() || filepath.Ext(path) != ".commit" {
+			return nil
+		}
+		record, err := readCommittedBatchRecord(path)
+		if err != nil {
+			return err
+		}
+		if record.BatchID != "" {
+			committed[record.BatchID] = struct{}{}
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return committed, nil
+}
+
+func (s *stageStore) CommittedBatchCount(ctx context.Context, changefeed string) (int, error) {
+	if s.root == "" {
+		return 0, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return 0, errors.New("iceberg changefeed is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	root := filepath.Join(s.root, pathSegment(changefeed), ".committed")
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, errors.Trace(err)
+	}
+
+	count := 0
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d != nil && !d.IsDir() && filepath.Ext(path) == ".commit" {
+			count++
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	return count, nil
 }
 
 func (s *stageStore) Delete(path string) error {
@@ -302,6 +466,57 @@ func readStagedBatch(path string) (stagedBatch, error) {
 	return batch, nil
 }
 
+func readCommittedBatchRecord(path string) (committedBatchRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return committedBatchRecord{}, errors.Trace(err)
+	}
+	defer file.Close()
+
+	var record committedBatchRecord
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&record); err != nil {
+		return committedBatchRecord{}, errors.Trace(err)
+	}
+	if record.BatchID == "" {
+		return committedBatchRecord{}, errors.New("iceberg committed ledger batch id is empty")
+	}
+	return record, nil
+}
+
+func writeCommittedBatchRecord(dir string, finalName string, record committedBatchRecord) error {
+	tmp, err := os.CreateTemp(dir, ".ledger-*.tmp")
+	if err != nil {
+		return errors.Trace(err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	encoder := json.NewEncoder(tmp)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(&record); err != nil {
+		_ = tmp.Close()
+		return errors.Trace(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return errors.Trace(err)
+	}
+	if err := tmp.Close(); err != nil {
+		return errors.Trace(err)
+	}
+	if err := os.Rename(tmpName, finalName); err != nil {
+		return errors.Trace(err)
+	}
+	cleanup = false
+	return nil
+}
+
 const stagingRowIDField = "_ticdc_iceberg_row_id"
 
 func prepareStagedRows(identifier []string, rows []map[string]any) ([]map[string]any, []string, error) {
@@ -374,6 +589,14 @@ func stagedRowIDs(identifier []string, rows []map[string]any, rowIDs []string) (
 
 func pathSegment(value string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func committedBatchLedgerDir(root string, changefeed string, identifier []string) string {
+	return filepath.Join(root, pathSegment(changefeed), ".committed", pathSegment(identifierKey(identifier)))
+}
+
+func committedBatchLedgerPath(root string, changefeed string, identifier []string, batchID string) string {
+	return filepath.Join(committedBatchLedgerDir(root, changefeed, identifier), batchID+".commit")
 }
 
 func stagedBatchID(identifier []string, rows []map[string]any, rowIDs []string, maxCommitTs uint64) (string, error) {

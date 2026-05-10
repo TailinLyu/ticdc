@@ -45,7 +45,7 @@ Result format:
 
 Final verification:
 
-- `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1` passed.
+- `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1` passed.
 - MinIO owner-marker coverage passed:
   `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778378985`.
 - PrestoDB readback for `ice_s21.orders_cdc`: `D=400,I=6000,U=600`.
@@ -60,8 +60,8 @@ stable across replayed keyed rows even when TiCDC omits raw `RowKey` bytes.
 
 | ID | Scenario | Status | Fresh evidence | Notes |
 | --- | --- | --- | --- | --- |
-| S03 | Committer exits after Iceberg append but before staged-file delete | PASS | `S03_REPLAY_PASS cf=s03-replay-1778391385 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s03_append_exit_replay.sh`. A smaller rerun exposed a six-row duplicate when target ownership was claimed after staging; the final pass verifies the claim now happens before the stage file is visible. |
-| S05 | Non-committer exits after staging but before `PostFlush` | PASS | `S05_REPLAY_PASS cf=s05-replay-1778391501 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s05_stage_exit_replay.sh`. |
+| S03 | Committer exits after Iceberg append but before staged-file delete | PASS | `S03_REPLAY_PASS cf=s03-replay-1778393646 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s03_append_exit_replay.sh`. A smaller rerun exposed a six-row duplicate when target ownership was claimed after staging; the final pass verifies the claim now happens before the stage file is visible. The latest code also adds a shared-staging committed-batch ledger so retained stage files are not deduped only by Iceberg snapshot summaries. |
+| S05 | Non-committer exits after staging but before `PostFlush` | PASS | `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s05_stage_exit_replay.sh`. Metrics scrape after the run showed commit duration, committed batch, committed row, and ledger write/lookup counters on the surviving committer. |
 | S09 | Iceberg REST outage while staged files exist, then recovery | PASS | `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0` | REST was stopped, staged files accumulated, REST was restarted, and TiCDC drained without a TiCDC restart. |
 | S11 | Staged-file delete failure after successful append | PASS | `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s11_append_error_replay.sh`. |
 | S12 | High-volume staged-batch drain | PASS | `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0` | Reran at the prior high-volume size; local REST catalog drained fully. |
@@ -70,3 +70,29 @@ stable across replayed keyed rows even when TiCDC omits raw `RowKey` bytes.
 | S17 | Iceberg schema evolution DDL and live CREATE TABLE DDL | UNSUPPORTED / REJECTED | `S17_SCHEMA_UNSUPPORTED_PASS cf=s17-unsupported-1778391453 rule=ice_s17_unsupported_1778391453.orders ddl=ALTER TABLE ice_s17_unsupported_1778391453.orders ADD COLUMN extra VARCHAR(32) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`; `S17_CREATE_TABLE_UNSUPPORTED_PASS cf=s17-create-unsupported-1778391432 rule=ice_s17_create_1778391432.* ddl=CREATE TABLE ice_s17_create_1778391432.orders_created (...) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0` | Live DDL is rejected explicitly instead of being treated as partial schema evolution. Bootstrap/not-sync create DDL remains allowed. |
 | S19 | Duplicate detection/idempotency under replay | PASS / COVERED | Covered by fresh S03, S05, and S11 passes. | The duplicate replay windows now have repeatable local scripts. |
 | S20 | Long-running rolling TiCDC hard-restart loop | PASS | `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0` | Rolling restart duplicate inserts were fixed by stable keyed-row fallback IDs. |
+
+## 2026-05-10 Durable Ledger And Observability Follow-Up
+
+The reviewer-identified snapshot-expiration risk is now covered by a local unit
+regression: a batch marked in the shared-staging `.committed` ledger is skipped
+even when the Iceberg writer reports no committed batch IDs from snapshot
+history. Another regression verifies the ledger marker is written before the
+staged JSON file is deleted after append.
+
+The same loop added Iceberg sink metric coverage for staged bytes, staging
+backend info, committed rows, durable ledger entry count, ledger writes, and
+ledger lookups. This does not replace the need for S3/native staging soak; it
+documents and enforces the current PVC/shared-filesystem JSON staging boundary.
+
+Fresh local e2e reruns after the ledger and metrics patch:
+
+- `S03_REPLAY_PASS cf=s03-replay-1778393646 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+- `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+- Prometheus scrape for `s05-replay-1778393687` included
+  `ticdc_sink_iceberg_commit_duration_seconds`,
+  `ticdc_sink_iceberg_committed_batches_total`,
+  `ticdc_sink_iceberg_committed_rows_total`,
+  `ticdc_sink_iceberg_committed_ledger_lookups_total`, and
+  `ticdc_sink_iceberg_committed_ledger_writes_total`.
+- Shared staging cleanup after changefeed removal had `0` staged JSON files,
+  `0` committed ledger marker files, and `0` target-owner marker files.

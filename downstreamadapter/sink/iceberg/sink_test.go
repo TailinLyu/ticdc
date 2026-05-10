@@ -18,6 +18,7 @@ import (
 	stderrors "errors"
 	"io/fs"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -179,7 +180,9 @@ func TestSinkFlushesRowsOnCheckpoint(t *testing.T) {
 	require.NotContains(t, calls[0].props, "ticdc.checkpoint-ts")
 	require.Equal(t, "42", calls[0].props[snapshotCommitBarrierTsKey])
 	require.Equal(t, "1", calls[0].props["ticdc.commit-ts"])
-	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+	require.Eventually(t, func() bool {
+		return stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
 
 	cancel()
 	require.NoError(t, <-errCh)
@@ -372,7 +375,9 @@ func TestCommitterDrainsStagedBatchesFromMultipleWriters(t *testing.T) {
 		}
 		return rows == 2
 	}, 3*time.Second, 10*time.Millisecond)
-	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+	require.Eventually(t, func() bool {
+		return stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
 
 	cancel()
 	require.NoError(t, <-errCh)
@@ -396,6 +401,41 @@ func TestCommitterSkipsAlreadyCommittedStagedBatch(t *testing.T) {
 	require.Len(t, files, 1)
 	require.NotEmpty(t, files[0].batch.BatchID)
 	writer.markCommitted(identifier, files[0].batch.BatchID)
+
+	s := newSink(ctx, changefeedID, cfg, writer)
+	s.SetTableSchemaStore(nil)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddCheckpointTs(10)
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 0 && stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+func TestCommitterSkipsLedgerCommittedBatchAfterSnapshotHistoryExpires(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1), "name": "first"}},
+	}, 10))
+	files, err := stage.List(ctx, changefeedID.String())
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	require.NoError(t, stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{files[0].batch.BatchID}, 10, 1))
 
 	s := newSink(ctx, changefeedID, cfg, writer)
 	s.SetTableSchemaStore(nil)
@@ -481,7 +521,9 @@ func TestCommitterBatchesStagedFilesForSameTable(t *testing.T) {
 	calls := writer.getCalls()
 	require.Len(t, batchIDsFromProps(calls[0].props), 2)
 	require.Equal(t, "11", calls[0].props["ticdc.commit-ts"])
-	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+	require.Eventually(t, func() bool {
+		return stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
 
 	cancel()
 	require.NoError(t, <-errCh)
@@ -527,7 +569,9 @@ func TestCommitterDeduplicatesOverlappingStagedRows(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond)
 	calls := writer.getCalls()
 	require.Len(t, batchIDsFromProps(calls[0].props), 2)
-	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+	require.Eventually(t, func() bool {
+		return stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
 
 	cancel()
 	require.NoError(t, <-errCh)
@@ -572,7 +616,9 @@ func TestCommitterPreservesDistinctRowsWithSamePayload(t *testing.T) {
 	for _, row := range writer.getCalls()[0].rows {
 		require.NotContains(t, row, stagingRowIDField)
 	}
-	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+	require.Eventually(t, func() bool {
+		return stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
 
 	cancel()
 	require.NoError(t, <-errCh)
@@ -684,6 +730,57 @@ func TestCommitterDoesNotAppendBeforeCheckpointCoversStageFile(t *testing.T) {
 	require.Zero(t, stageFileCount(t, cfg.StagingDir))
 }
 
+func TestCommitterWritesDurableLedgerBeforeDeletingStageFile(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+	files, err := stage.List(ctx, changefeedID.String())
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	batchID := files[0].batch.BatchID
+
+	s := newSink(ctx, changefeedID, cfg, writer)
+	s.SetTableSchemaStore(nil)
+
+	require.NoError(t, s.drainStaged(ctx, 10))
+	require.Len(t, writer.getCalls(), 1)
+	require.Zero(t, stageFileCount(t, cfg.StagingDir))
+
+	ledger, err := stage.CommittedBatches(ctx, changefeedID.String(), identifier)
+	require.NoError(t, err)
+	require.Contains(t, ledger, batchID)
+}
+
+func TestStageListSkipsCommittedLedgerSubtree(t *testing.T) {
+	ctx := context.Background()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-test")
+	cfg := newSinkTestConfig(t, 1024)
+	stage := newStageStore(cfg.StagingDir)
+	identifier := []string{"test", "orders_cdc"}
+
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+	require.NoError(t, stage.MarkBatchesCommitted(ctx, changefeedID.String(), identifier, []string{"already-committed"}, 10, 1))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(committedBatchLedgerDir(cfg.StagingDir, changefeedID.String(), identifier), "not-a-stage-file.json"),
+		[]byte("{"),
+		0o644))
+
+	files, err := stage.List(ctx, changefeedID.String())
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+}
+
 func TestCommitterRetriesAppendFailureWithoutStopping(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -787,8 +884,8 @@ func TestSinkRecordsIcebergStagedBacklogMetrics(t *testing.T) {
 	defer s.closeMetrics()
 
 	stagedFiles := []stagedFile{
-		{batch: stagedBatch{Rows: []map[string]any{{"id": 1}, {"id": 2}}, CreatedAt: time.Now().Add(-2 * time.Second)}},
-		{batch: stagedBatch{Rows: []map[string]any{{"id": 3}}, CreatedAt: time.Now().Add(-1 * time.Second)}},
+		{sizeBytes: 120, batch: stagedBatch{Rows: []map[string]any{{"id": 1}, {"id": 2}}, CreatedAt: time.Now().Add(-2 * time.Second)}},
+		{sizeBytes: 80, batch: stagedBatch{Rows: []map[string]any{{"id": 3}}, CreatedAt: time.Now().Add(-1 * time.Second)}},
 	}
 	eligible := stagedFiles[:1]
 
@@ -806,6 +903,12 @@ func TestSinkRecordsIcebergStagedBacklogMetrics(t *testing.T) {
 		metrics.IcebergStagedOldestAgeGauge.WithLabelValues("default", "iceberg-metrics", "pending")), float64(0))
 	require.Greater(t, testutil.ToFloat64(
 		metrics.IcebergStagedOldestAgeGauge.WithLabelValues("default", "iceberg-metrics", "eligible")), float64(0))
+	require.Equal(t, float64(200), testutil.ToFloat64(
+		metrics.IcebergStagedBytesGauge.WithLabelValues("default", "iceberg-metrics", "pending")))
+	require.Equal(t, float64(120), testutil.ToFloat64(
+		metrics.IcebergStagedBytesGauge.WithLabelValues("default", "iceberg-metrics", "eligible")))
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		metrics.IcebergStagingBackendInfoGauge.WithLabelValues("default", "iceberg-metrics", "local_json")))
 }
 
 func TestSinkRecordsIcebergCommitMetrics(t *testing.T) {
@@ -836,8 +939,16 @@ func TestSinkRecordsIcebergCommitMetrics(t *testing.T) {
 
 	require.Equal(t, float64(1), testutil.ToFloat64(
 		metrics.IcebergCommittedBatchesCounter.WithLabelValues("default", "iceberg-commit-metrics")))
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		metrics.IcebergCommittedRowsCounter.WithLabelValues("default", "iceberg-commit-metrics")))
 	require.Equal(t, float64(10), testutil.ToFloat64(
 		metrics.IcebergCommitBarrierLagGauge.WithLabelValues("default", "iceberg-commit-metrics")))
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		metrics.IcebergCommittedLedgerEntriesGauge.WithLabelValues("default", "iceberg-commit-metrics")))
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		metrics.IcebergCommittedLedgerWritesCounter.WithLabelValues("default", "iceberg-commit-metrics", "success")))
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		metrics.IcebergCommittedLedgerLookupsCounter.WithLabelValues("default", "iceberg-commit-metrics", "success")))
 
 	cancel()
 	require.NoError(t, <-errCh)

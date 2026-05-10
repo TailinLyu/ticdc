@@ -387,7 +387,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		committedBatches, ok := committedByIdentifier[key]
 		if !ok {
 			var err error
-			committedBatches, err = writer.CommittedBatches(ctx, staged.batch.Identifier)
+			committedBatches, err = s.committedBatches(ctx, writer, staged.batch.Identifier)
 			if err != nil {
 				s.recordAppendFailure("committed_batch_lookup")
 				log.Warn("iceberg committer will retry after committed batch lookup failure",
@@ -401,6 +401,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		}
 		if _, committed := committedBatches[staged.batch.BatchID]; committed {
 			rememberRowIDs(seenRowIDs, rowIDs)
+			if err := s.markBatchesCommitted(ctx, staged.batch.Identifier, []string{staged.batch.BatchID}, staged.batch.MaxCommitTs, len(staged.batch.Rows)); err != nil {
+				return errors.Trace(err)
+			}
 			if stagedBatchSafeToDelete(staged.batch, checkpointTs) {
 				if err := s.stage.Delete(staged.path); err != nil {
 					return errors.Trace(err)
@@ -481,6 +484,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			}
 			committed, checkErr := allBatchesCommitted(ctx, writer, group.identifier, group.batchIDs)
 			if checkErr == nil && committed {
+				if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, len(group.rows)); err != nil {
+					return errors.Trace(err)
+				}
 				if err := s.deleteStagedFiles(group.files); err != nil {
 					return errors.Trace(err)
 				}
@@ -498,8 +504,11 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			s.resetWriter()
 			return nil
 		}
+		if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, len(group.rows)); err != nil {
+			return errors.Trace(err)
+		}
 		s.recordCommitDuration("success", time.Since(appendStart))
-		s.recordCommitSuccess(len(group.batchIDs), checkpointTs, group.maxCommitTs)
+		s.recordCommitSuccess(len(group.batchIDs), len(group.rows), checkpointTs, group.maxCommitTs)
 		if err := runIcebergFaultHook(icebergFaultAfterAppendBeforeStageDelete); err != nil {
 			return errors.Trace(err)
 		}
@@ -535,6 +544,49 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 	}
 	if err := s.refreshStageMetrics(ctx, checkpointTs); err != nil {
 		log.Warn("failed to refresh iceberg staged metrics",
+			zap.String("changefeed", s.changefeedID.String()),
+			zap.Error(err))
+	}
+	return nil
+}
+
+func (s *sink) committedBatches(ctx context.Context, writer appendWriter, identifier []string) (map[string]struct{}, error) {
+	committedBatches, err := writer.CommittedBatches(ctx, identifier)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	ledgerBatches, err := s.stage.CommittedBatches(ctx, s.changefeedID.String(), identifier)
+	if err != nil {
+		s.recordCommittedLedgerLookup("error")
+		return nil, errors.Trace(err)
+	}
+	s.recordCommittedLedgerLookup("success")
+	if len(ledgerBatches) == 0 {
+		return committedBatches, nil
+	}
+	if committedBatches == nil {
+		committedBatches = make(map[string]struct{}, len(ledgerBatches))
+	}
+	for batchID := range ledgerBatches {
+		committedBatches[batchID] = struct{}{}
+	}
+	return committedBatches, nil
+}
+
+func (s *sink) markBatchesCommitted(
+	ctx context.Context,
+	identifier []string,
+	batchIDs []string,
+	maxCommitTs uint64,
+	rowCount int,
+) error {
+	if err := s.stage.MarkBatchesCommitted(ctx, s.changefeedID.String(), identifier, batchIDs, maxCommitTs, rowCount); err != nil {
+		s.recordCommittedLedgerWrite("error")
+		return errors.Trace(err)
+	}
+	s.recordCommittedLedgerWrite("success")
+	if err := s.refreshCommittedLedgerMetrics(ctx); err != nil {
+		log.Warn("failed to refresh iceberg committed ledger metrics",
 			zap.String("changefeed", s.changefeedID.String()),
 			zap.Error(err))
 	}
@@ -593,6 +645,9 @@ func (s *sink) recordStageMetrics(stagedFiles []stagedFile, eligible []stagedFil
 	metrics.IcebergStagedRowsGauge.WithLabelValues(keyspace, changefeed, "eligible").Set(float64(eligibleRows))
 	metrics.IcebergStagedOldestAgeGauge.WithLabelValues(keyspace, changefeed, "pending").Set(stagedOldestAgeSeconds(stagedFiles))
 	metrics.IcebergStagedOldestAgeGauge.WithLabelValues(keyspace, changefeed, "eligible").Set(stagedOldestAgeSeconds(eligible))
+	metrics.IcebergStagedBytesGauge.WithLabelValues(keyspace, changefeed, "pending").Set(float64(stagedBytes(stagedFiles)))
+	metrics.IcebergStagedBytesGauge.WithLabelValues(keyspace, changefeed, "eligible").Set(float64(stagedBytes(eligible)))
+	metrics.IcebergStagingBackendInfoGauge.WithLabelValues(keyspace, changefeed, "local_json").Set(1)
 }
 
 func (s *sink) refreshStageMetrics(ctx context.Context, checkpointTs uint64) error {
@@ -601,6 +656,9 @@ func (s *sink) refreshStageMetrics(ctx context.Context, checkpointTs uint64) err
 		return errors.Trace(err)
 	}
 	s.recordStageMetrics(stagedFiles, eligibleStagedFiles(stagedFiles, checkpointTs))
+	if err := s.refreshCommittedLedgerMetrics(ctx); err != nil {
+		return errors.Trace(err)
+	}
 	return nil
 }
 
@@ -617,9 +675,20 @@ func (s *sink) recordCommitDuration(result string, duration time.Duration) {
 		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Observe(duration.Seconds())
 }
 
-func (s *sink) recordCommitSuccess(batchCount int, checkpointTs uint64, maxCommitTs uint64) {
+func (s *sink) refreshCommittedLedgerMetrics(ctx context.Context) error {
+	count, err := s.stage.CommittedBatchCount(ctx, s.changefeedID.String())
+	if err != nil {
+		return errors.Trace(err)
+	}
+	metrics.IcebergCommittedLedgerEntriesGauge.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name()).Set(float64(count))
+	return nil
+}
+
+func (s *sink) recordCommitSuccess(batchCount int, rowCount int, checkpointTs uint64, maxCommitTs uint64) {
 	keyspace, changefeed := s.changefeedID.Keyspace(), s.changefeedID.Name()
 	metrics.IcebergCommittedBatchesCounter.WithLabelValues(keyspace, changefeed).Add(float64(batchCount))
+	metrics.IcebergCommittedRowsCounter.WithLabelValues(keyspace, changefeed).Add(float64(rowCount))
 	if checkpointTs >= maxCommitTs {
 		metrics.IcebergCommitBarrierLagGauge.WithLabelValues(keyspace, changefeed).Set(float64(checkpointTs - maxCommitTs))
 		return
@@ -630,6 +699,16 @@ func (s *sink) recordCommitSuccess(batchCount int, checkpointTs uint64, maxCommi
 func (s *sink) recordAppendFailure(reason string) {
 	metrics.IcebergAppendFailureCounter.WithLabelValues(
 		s.changefeedID.Keyspace(), s.changefeedID.Name(), reason).Inc()
+}
+
+func (s *sink) recordCommittedLedgerWrite(result string) {
+	metrics.IcebergCommittedLedgerWritesCounter.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Inc()
+}
+
+func (s *sink) recordCommittedLedgerLookup(result string) {
+	metrics.IcebergCommittedLedgerLookupsCounter.WithLabelValues(
+		s.changefeedID.Keyspace(), s.changefeedID.Name(), result).Inc()
 }
 
 func appendFailureReason(err error) string {
@@ -657,7 +736,11 @@ func (s *sink) closeStageMetrics() {
 	metrics.IcebergStagedRowsGauge.DeleteLabelValues(keyspace, changefeed, "eligible")
 	metrics.IcebergStagedOldestAgeGauge.DeleteLabelValues(keyspace, changefeed, "pending")
 	metrics.IcebergStagedOldestAgeGauge.DeleteLabelValues(keyspace, changefeed, "eligible")
+	metrics.IcebergStagedBytesGauge.DeleteLabelValues(keyspace, changefeed, "pending")
+	metrics.IcebergStagedBytesGauge.DeleteLabelValues(keyspace, changefeed, "eligible")
 	metrics.IcebergCommitBarrierLagGauge.DeleteLabelValues(keyspace, changefeed)
+	metrics.IcebergCommittedLedgerEntriesGauge.DeleteLabelValues(keyspace, changefeed)
+	metrics.IcebergStagingBackendInfoGauge.DeleteLabelValues(keyspace, changefeed, "local_json")
 }
 
 func (s *sink) closeTargetOwnerConflictMetric() {
@@ -684,6 +767,14 @@ func stagedRows(stagedFiles []stagedFile) int {
 		rows += len(staged.batch.Rows)
 	}
 	return rows
+}
+
+func stagedBytes(stagedFiles []stagedFile) int64 {
+	var bytes int64
+	for _, staged := range stagedFiles {
+		bytes += staged.sizeBytes
+	}
+	return bytes
 }
 
 func stagedOldestAgeSeconds(stagedFiles []stagedFile) float64 {

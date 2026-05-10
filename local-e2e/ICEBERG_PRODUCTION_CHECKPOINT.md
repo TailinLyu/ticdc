@@ -23,9 +23,24 @@ matrix.
   S3-compatible warehouses. Non-local warehouses require an explicit local/shared
   `staging-dir` while JSON staging remains in this PR. Other cloud warehouse
   schemes are rejected instead of being silently accepted.
-- The sink exposes initial Iceberg operator metrics for staged backlog, oldest
-  staged age, commit latency/result, committed batch count, commit-barrier lag,
-  append failures, cleanup failures, and target-owner conflicts.
+- JSON row staging is explicitly bounded to a local/shared filesystem path, such
+  as a PVC mounted at the same path on every TiCDC capture. `s3://` is supported
+  for the Iceberg warehouse and target-owner marker path, not for native staged
+  JSON batch storage.
+- The committer deduplicates replay through two sources: Iceberg snapshot
+  summaries and a durable committed-batch ledger under
+  `<staging-dir>/<base64(changefeed)>/.committed/<base64(target)>/*.commit`.
+  The ledger is written and synced before staged files are deleted, and snapshot
+  summary hits backfill missing ledger entries.
+- The ledger removes snapshot-expiration-only replay risk when the shared staging
+  directory is retained. The remaining runbook guard is: do not purge staged
+  files or `.committed` ledger markers before the maximum replay horizon, and do
+  not expire all relevant Iceberg snapshots while retained staged files may still
+  predate the ledger write after an append crash.
+- The sink exposes Iceberg operator metrics for staged files/rows/bytes, oldest
+  staged age, commit latency/result, committed batch and row counts, durable
+  ledger entries/writes/lookups, staging backend, commit-barrier lag, append
+  failures, cleanup failures, and target-owner conflicts.
 - Replayed DML row IDs are stable across processor restart splits when TiCDC
   does not populate raw `RowKey`: the sink falls back to the table primary/handle
   key and only uses row index for tables without a usable logical key.
@@ -40,12 +55,21 @@ matrix.
 ## Latest Local Evidence
 
 - Focused unit and helper packages:
-  - `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e -count=1`
+  - `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1`
+  - Focused durable-ledger/metrics regression tests cover snapshot-history
+    expiration dedupe, ledger-before-delete ordering, staged byte/backend
+    metrics, committed row metrics, and ledger write/lookup metrics.
 - Replay/crash reruns:
-  - `S03_REPLAY_PASS cf=s03-replay-1778391385 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
-  - `S05_REPLAY_PASS cf=s05-replay-1778391501 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S03_REPLAY_PASS cf=s03-replay-1778393646 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S05_REPLAY_PASS cf=s05-replay-1778393687 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
   - `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0`
+- Metrics scrape after S05 showed `ticdc_sink_iceberg_commit_duration_seconds`,
+  `ticdc_sink_iceberg_committed_batches_total`,
+  `ticdc_sink_iceberg_committed_rows_total`,
+  `ticdc_sink_iceberg_committed_ledger_lookups_total`, and
+  `ticdc_sink_iceberg_committed_ledger_writes_total` for
+  `s05-replay-1778393687`.
 - Catalog and drain reruns:
   - `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0`
   - `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0`
@@ -74,7 +98,8 @@ matrix.
 
 - Replace JSON row staging with Iceberg-native data-file committables. Reuse the
   mature cloud/external-storage writer path where possible instead of inventing a
-  separate high-throughput file pipeline.
+  separate high-throughput file pipeline. This is still the next architecture
+  loop before calling the sink production-shape for high throughput.
 - Add a real per-Iceberg-target commit coordinator if many-source or
   many-changefeed-to-one-target must become supported. Until then, keep the
   warehouse owner marker as a hard rejection.
@@ -82,7 +107,9 @@ matrix.
   Still missing explicit catalog retry counters and table-creation/schema-failure
   counters.
 - Extend MinIO/S3-style integration coverage beyond the owner marker to include
-  staged-file cleanup and eventually remote/native data-file staging.
+  credential/auth failure modes, remote orphan cleanup, and eventually
+  remote/native data-file staging. The current S3 support is the warehouse path
+  and owner marker; staged JSON remains shared filesystem/PVC only.
 - Expand local scale tests by simulating thousands of changefeeds with many small
   tables, aggressive checkpoint cadence, catalog outage/recovery, and staged
   backlog drain limits. A single laptop cannot prove 30GB/s, but it can catch
