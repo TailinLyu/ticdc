@@ -62,11 +62,12 @@ type committedBatchRecord struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-type committedRowRecord struct {
+type committedRowSegmentRecord struct {
 	Changefeed  string    `json:"changefeed"`
-	RowID       string    `json:"row_id"`
 	Identifier  []string  `json:"identifier"`
 	BatchIDs    []string  `json:"batch_ids"`
+	Bucket      string    `json:"bucket"`
+	RowIDs      []string  `json:"row_ids"`
 	MaxCommitTs uint64    `json:"max_commit_ts"`
 	CreatedAt   time.Time `json:"created_at"`
 }
@@ -329,7 +330,7 @@ func (s *stageStore) MarkRowsCommitted(
 		return 0, errors.Trace(err)
 	}
 
-	created := 0
+	buckets := make(map[string][]string)
 	seen := make(map[string]struct{}, len(rowIDs))
 	for _, rowID := range rowIDs {
 		if rowID == "" {
@@ -339,11 +340,18 @@ func (s *stageStore) MarkRowsCommitted(
 			continue
 		}
 		seen[rowID] = struct{}{}
+		bucket := committedRowLedgerBucket(rowID)
+		buckets[bucket] = append(buckets[bucket], rowID)
+	}
+
+	createdRows := 0
+	createdAt := time.Now().UTC()
+	for bucket, bucketRowIDs := range buckets {
 		if err := ctx.Err(); err != nil {
 			return 0, errors.Trace(err)
 		}
-
-		finalName := committedRowLedgerPath(s.root, changefeed, identifier, rowID)
+		sort.Strings(bucketRowIDs)
+		finalName := committedRowSegmentLedgerPath(s.root, changefeed, identifier, bucket, batchIDs, maxCommitTs)
 		dir := filepath.Dir(finalName)
 		if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
 			return 0, errors.Trace(err)
@@ -354,20 +362,21 @@ func (s *stageStore) MarkRowsCommitted(
 			return 0, errors.Trace(err)
 		}
 
-		record := committedRowRecord{
+		record := committedRowSegmentRecord{
 			Changefeed:  changefeed,
-			RowID:       rowID,
 			Identifier:  append([]string(nil), identifier...),
-			BatchIDs:    append([]string(nil), batchIDs...),
+			BatchIDs:    sortedStringsCopy(batchIDs),
+			Bucket:      bucket,
+			RowIDs:      append([]string(nil), bucketRowIDs...),
 			MaxCommitTs: maxCommitTs,
-			CreatedAt:   time.Now().UTC(),
+			CreatedAt:   createdAt,
 		}
-		if err := writeCommittedRowRecord(dir, finalName, record); err != nil {
+		if err := writeCommittedRowSegmentRecord(dir, finalName, record); err != nil {
 			return 0, errors.Trace(err)
 		}
-		created++
+		createdRows += len(bucketRowIDs)
 	}
-	return created, nil
+	return createdRows, nil
 }
 
 func (s *stageStore) CommittedRowIDsForCandidates(
@@ -390,33 +399,57 @@ func (s *stageStore) CommittedRowIDsForCandidates(
 	}
 
 	committed := make(map[string]struct{}, len(rowIDs))
-	seen := make(map[string]struct{}, len(rowIDs))
+	neededByBucket := make(map[string]map[string]struct{})
 	for _, rowID := range rowIDs {
 		if rowID == "" {
 			return nil, errors.New("iceberg committed row id is empty")
 		}
-		if _, ok := seen[rowID]; ok {
-			continue
+		bucket := committedRowLedgerBucket(rowID)
+		needed := neededByBucket[bucket]
+		if needed == nil {
+			needed = make(map[string]struct{})
+			neededByBucket[bucket] = needed
 		}
-		seen[rowID] = struct{}{}
+		needed[rowID] = struct{}{}
+	}
+
+	for bucket, needed := range neededByBucket {
 		if err := ctx.Err(); err != nil {
 			return nil, errors.Trace(err)
 		}
-		path := committedRowLedgerPath(s.root, changefeed, identifier, rowID)
-		if _, err := os.Stat(path); err != nil {
+		dir := committedRowSegmentLedgerDir(s.root, changefeed, identifier, bucket)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return nil, errors.Trace(err)
 		}
-		record, err := readCommittedRowRecord(path)
-		if err != nil {
-			return nil, errors.Trace(err)
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Name() > entries[j].Name()
+		})
+		for _, entry := range entries {
+			if len(needed) == 0 {
+				break
+			}
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".rows" {
+				continue
+			}
+			record, err := readCommittedRowSegmentRecord(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			if record.Bucket != bucket {
+				return nil, errors.Errorf("iceberg committed row ledger bucket mismatch: path=%s record=%s", bucket, record.Bucket)
+			}
+			for _, rowID := range record.RowIDs {
+				if _, ok := needed[rowID]; !ok {
+					continue
+				}
+				committed[rowID] = struct{}{}
+				delete(needed, rowID)
+			}
 		}
-		if record.RowID != rowID {
-			return nil, errors.Errorf("iceberg committed row id mismatch: path=%s record=%s", rowID, record.RowID)
-		}
-		committed[rowID] = struct{}{}
 	}
 	return committed, nil
 }
@@ -550,20 +583,23 @@ func readCommittedBatchRecord(path string) (committedBatchRecord, error) {
 	return record, nil
 }
 
-func readCommittedRowRecord(path string) (committedRowRecord, error) {
+func readCommittedRowSegmentRecord(path string) (committedRowSegmentRecord, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return committedRowRecord{}, errors.Trace(err)
+		return committedRowSegmentRecord{}, errors.Trace(err)
 	}
 	defer file.Close()
 
-	var record committedRowRecord
+	var record committedRowSegmentRecord
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&record); err != nil {
-		return committedRowRecord{}, errors.Trace(err)
+		return committedRowSegmentRecord{}, errors.Trace(err)
 	}
-	if record.RowID == "" {
-		return committedRowRecord{}, errors.New("iceberg committed row id is empty")
+	if record.Bucket == "" {
+		return committedRowSegmentRecord{}, errors.New("iceberg committed row ledger bucket is empty")
+	}
+	if len(record.RowIDs) == 0 {
+		return committedRowSegmentRecord{}, errors.New("iceberg committed row segment is empty")
 	}
 	return record, nil
 }
@@ -572,7 +608,7 @@ func writeCommittedBatchRecord(dir string, finalName string, record committedBat
 	return writeJSONFileAtomically(dir, ".ledger-*.tmp", finalName, &record)
 }
 
-func writeCommittedRowRecord(dir string, finalName string, record committedRowRecord) error {
+func writeCommittedRowSegmentRecord(dir string, finalName string, record committedRowSegmentRecord) error {
 	return writeJSONFileAtomically(dir, ".row-ledger-*.tmp", finalName, &record)
 }
 
@@ -662,7 +698,10 @@ func syncDirectory(path string) error {
 	return nil
 }
 
-const stagingRowIDField = "_ticdc_iceberg_row_id"
+const (
+	stagingRowIDField             = "_ticdc_iceberg_row_id"
+	committedRowLedgerBucketCount = 16
+)
 
 func prepareStagedRows(identifier []string, rows []map[string]any) ([]map[string]any, []string, error) {
 	stagedRows := make([]map[string]any, 0, len(rows))
@@ -748,10 +787,47 @@ func committedRowLedgerDir(root string, changefeed string, identifier []string) 
 	return filepath.Join(root, pathSegment(changefeed), ".committed-rows", pathSegment(identifierKey(identifier)))
 }
 
-func committedRowLedgerPath(root string, changefeed string, identifier []string, rowID string) string {
+func committedRowSegmentLedgerDir(root string, changefeed string, identifier []string, bucket string) string {
+	return filepath.Join(committedRowLedgerDir(root, changefeed, identifier), bucket)
+}
+
+func committedRowLedgerBucket(rowID string) string {
 	sum := sha256.Sum256([]byte(rowID))
-	encoded := hex.EncodeToString(sum[:])
-	return filepath.Join(committedRowLedgerDir(root, changefeed, identifier), encoded[:2], encoded+".row")
+	return hex.EncodeToString(sum[:])[:1]
+}
+
+func committedRowSegmentLedgerPath(
+	root string,
+	changefeed string,
+	identifier []string,
+	bucket string,
+	batchIDs []string,
+	maxCommitTs uint64,
+) string {
+	payload := struct {
+		Bucket      string   `json:"bucket"`
+		BatchIDs    []string `json:"batch_ids"`
+		MaxCommitTs uint64   `json:"max_commit_ts"`
+	}{
+		Bucket:      bucket,
+		BatchIDs:    sortedStringsCopy(batchIDs),
+		MaxCommitTs: maxCommitTs,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		encoded = []byte(bucket)
+	}
+	sum := sha256.Sum256(encoded)
+	segmentID := hex.EncodeToString(sum[:])
+	return filepath.Join(
+		committedRowSegmentLedgerDir(root, changefeed, identifier, bucket),
+		fmt.Sprintf("%020d-%s-%s.rows", maxCommitTs, bucket, segmentID[:16]))
+}
+
+func sortedStringsCopy(values []string) []string {
+	copied := append([]string(nil), values...)
+	sort.Strings(copied)
+	return copied
 }
 
 func stagedBatchID(identifier []string, rows []map[string]any, rowIDs []string, maxCommitTs uint64) (string, error) {

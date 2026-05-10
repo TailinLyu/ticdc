@@ -212,17 +212,18 @@ Remaining intentional limitations:
   shared filesystem or PVC. A staged JSON batch is made visible only after temp
   write, file fsync, close, atomic rename, and parent directory fsync.
 - Replay dedupe now uses Iceberg snapshot summaries, a durable committed-batch
-  ledger under `.committed`, and a durable committed row-ID ledger under
+  ledger under `.committed`, and a durable committed row-ID segment ledger under
   `.committed-rows` in the shared staging directory. Operators must retain
   staged files and committed ledger markers for at least the maximum replay
-  horizon. Ledger lookups are direct by current candidate marker path, and
-  Iceberg snapshot-summary dedupe scans newest-first and stops once the current
-  staged batch candidates are found. Partial-overlap replay is restart-safe even
-  when the overlapping replay batch is staged after the earlier stage file has
-  already been cleaned up; duplicate-only replay batches are marked handled
-  before cleanup, and the bounded row-ID cache is only an in-process
-  optimization. Native Iceberg data-file committables remain the target
-  production design.
+  horizon. Batch-ledger lookup is direct by current candidate marker path, and
+  row-ledger lookup reads only the sharded segment buckets for current candidate
+  row IDs. Iceberg snapshot-summary dedupe scans newest-first and stops once the
+  current staged batch candidates are found. Partial-overlap replay is
+  restart-safe even when the overlapping replay batch is staged after the
+  earlier stage file has already been cleaned up; duplicate-only replay batches
+  are marked handled before cleanup, and the bounded row-ID cache is only an
+  in-process optimization. Native Iceberg data-file committables remain the
+  target production design.
 - Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
   `run_s17_schema_unsupported.sh` and
   `run_s17_create_table_unsupported.sh` verify that live DDL is rejected

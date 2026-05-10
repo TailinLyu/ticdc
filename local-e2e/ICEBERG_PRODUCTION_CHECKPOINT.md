@@ -34,16 +34,17 @@ matrix.
 - The committer deduplicates replay through Iceberg snapshot summaries, a
   durable committed-batch ledger under
   `<staging-dir>/<base64(changefeed)>/.committed/<base64(target)>/*.commit`,
-  and a durable row-ID ledger under `.committed-rows`. Batch and row markers are
-  written and synced before staged files are deleted, and snapshot summary hits
-  backfill missing local markers.
+  and a durable row-ID segment ledger under `.committed-rows`. Batch markers
+  and row-ID segments are written and synced before staged files are deleted,
+  and snapshot summary hits backfill missing local markers.
 - The replay hot path does not scan retained marker trees into memory. It looks
   up only the candidate staged batch IDs and row IDs currently being drained;
   Iceberg snapshot summaries are scanned from newest to oldest until those batch
-  candidates are found, and local ledger lookup is direct by candidate marker
-  path. The batch and row ledger entry gauges are updated incrementally for
-  markers written by the running TiCDC process instead of walking the ledger
-  trees on every metrics refresh.
+  candidates are found. Batch-ledger lookup is direct by candidate marker path,
+  and row-ledger lookup reads only the sharded segment buckets for current
+  candidate row IDs. The batch and row ledger entry gauges are updated
+  incrementally for entries written by the running TiCDC process instead of
+  walking the ledger trees on every metrics refresh.
 - The ledgers remove snapshot-expiration-only replay risk and delayed
   partial-overlap replay risk when the shared staging directory is retained. The
   remaining runbook guard is: do not purge staged files, `.committed`, or
@@ -81,14 +82,15 @@ matrix.
   - `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1`
   - Focused durable-ledger/metrics regression tests cover snapshot-history
     expiration dedupe, delayed partial-overlap replay after cleanup,
-    ledger-before-delete ordering, staged byte/backend metrics, committed row
-    metrics, and batch/row ledger write/lookup metrics.
+    5k-row row-ledger segment cardinality, ledger-before-delete ordering,
+    staged byte/backend metrics, committed row metrics, and batch/row ledger
+    write/lookup metrics.
   - Focused review regressions cover staged-file fsync plus parent-directory
     fsync before return, candidate-bounded snapshot-summary dedupe, and
     restart-safe partial-overlap replay dedupe.
 - Replay/crash reruns:
-  - `S03_REPLAY_PASS cf=s03-replay-1778401106 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
-  - `S05_REPLAY_PASS cf=s05-replay-1778401067 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S03_REPLAY_PASS cf=s03-replay-1778402711 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+  - `S05_REPLAY_PASS cf=s05-replay-1778402664 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
   - `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0`
   - `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0`
 - Earlier metrics scrape after S05 showed `ticdc_sink_iceberg_commit_duration_seconds`,
