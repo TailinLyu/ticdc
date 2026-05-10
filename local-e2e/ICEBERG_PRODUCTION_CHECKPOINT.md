@@ -26,7 +26,10 @@ matrix.
 - JSON row staging is explicitly bounded to a local/shared filesystem path, such
   as a PVC mounted at the same path on every TiCDC capture. `s3://` is supported
   for the Iceberg warehouse and target-owner marker path, not for native staged
-  JSON batch storage.
+  JSON batch storage. The staging path must provide POSIX file fsync, directory
+  fsync, atomic rename, and Bolt-compatible mmap/flock semantics for
+  `.committed-row-index`; generic NFS/RWX/object-fuse mounts are unsupported
+  unless they explicitly provide those semantics.
 - A staged JSON batch is treated as the source-progress durability boundary: it
   is written to a temp file, fsynced, closed, atomically renamed, and then the
   containing target staging directory is fsynced before the writer can
@@ -156,6 +159,9 @@ matrix.
   credential/auth failure modes, remote orphan cleanup, and eventually
   remote/native data-file staging. The current S3 support is the warehouse path
   and owner marker; staged JSON remains shared filesystem/PVC only.
+- Add deployment validation/runbook checks for the staging filesystem contract:
+  identical mount path on every capture, durable file and directory fsync,
+  atomic rename, and Bolt-compatible mmap/flock locking.
 - Expand local scale tests by simulating thousands of changefeeds with many small
   tables, aggressive checkpoint cadence, catalog outage/recovery, and staged
   backlog drain limits. A single laptop cannot prove 30GB/s, but it can catch

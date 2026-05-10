@@ -38,7 +38,10 @@ The remaining design compromise is bounded JSON row staging. The current replay
 dedupe story no longer depends only on Iceberg snapshot summaries because the
 committer also writes durable `.committed` batch markers, `.committed-rows`
 row-ID segment markers, and `.committed-row-index` Bolt row-hash shard indexes
-in the shared staging directory before deleting staged files.
+in the shared staging directory before deleting staged files. That staging path
+must provide POSIX file fsync, directory fsync, atomic rename, and
+Bolt-compatible mmap/flock semantics; generic NFS/RWX/object-fuse mounts are
+unsupported unless they explicitly provide those semantics.
 Staged JSON files are published with temp write, file fsync, close, atomic
 rename, and parent directory fsync before upstream progress is acknowledged.
 Ledger lookup checks only candidate staged batch IDs by marker path and only the

@@ -209,8 +209,11 @@ Remaining intentional limitations:
   `run_s16_minio_owner_marker.sh`; staged files are still local/shared-path
   JSON and need follow-up before S3-native high-throughput staging. For now,
   every TiCDC capture must see the same `staging-dir` path, typically through a
-  shared filesystem or PVC. A staged JSON batch is made visible only after temp
-  write, file fsync, close, atomic rename, and parent directory fsync.
+  shared filesystem or PVC. That path must provide POSIX file fsync, directory
+  fsync, atomic rename, and Bolt-compatible mmap/flock semantics; generic
+  NFS/RWX/object-fuse mounts are unsupported unless they explicitly provide
+  those semantics. A staged JSON batch is made visible only after temp write,
+  file fsync, close, atomic rename, and parent directory fsync.
 - Replay dedupe now uses Iceberg snapshot summaries, a durable committed-batch
   ledger under `.committed`, a durable committed row-ID segment ledger under
   `.committed-rows`, and Bolt-backed exact row-hash shard indexes under

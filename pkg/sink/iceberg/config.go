@@ -26,12 +26,16 @@ const (
 	defaultCommitInterval = 60 * time.Second
 	defaultBatchRows      = 1024
 	defaultTableSuffix    = "_cdc"
+
+	stagingDirContract = "staging-dir must be a local POSIX filesystem path mounted at the same path on every TiCDC capture; it must provide reliable file fsync, directory fsync, atomic rename, and Bolt-compatible mmap/flock locking semantics"
 )
 
 // Config contains the local-first Iceberg sink settings parsed from sink-uri.
 type Config struct {
-	CatalogURI     string
-	Warehouse      string
+	CatalogURI string
+	Warehouse  string
+	// StagingDir follows stagingDirContract. Shared PVC/RWX/NFS-like paths are
+	// supported only when they provide those POSIX and Bolt locking semantics.
 	StagingDir     string
 	DatabasePrefix string
 	TableSuffix    string
@@ -86,7 +90,7 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 	} else {
 		stagingDir, err := defaultStagingPath(cfg.Warehouse)
 		if err != nil {
-			return nil, fmt.Errorf("iceberg sink URI must include staging-dir when warehouse is not a local path: %w", err)
+			return nil, fmt.Errorf("iceberg sink URI must include staging-dir when warehouse is not a local path; %s: %w", stagingDirContract, err)
 		}
 		cfg.StagingDir = stagingDir
 	}

@@ -57,6 +57,8 @@ func TestParseConfigRequiresExplicitStagingDirForRemoteWarehouse(t *testing.T) {
 	_, err = ParseConfig(uri)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must include staging-dir")
+	require.Contains(t, err.Error(), "POSIX filesystem")
+	require.Contains(t, err.Error(), "mmap/flock")
 }
 
 func TestParseConfigAllowsRemoteWarehouseWithExplicitStagingDir(t *testing.T) {

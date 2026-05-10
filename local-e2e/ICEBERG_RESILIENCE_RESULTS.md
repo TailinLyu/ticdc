@@ -83,7 +83,10 @@ The same loop added Iceberg sink metric coverage for staged bytes, staging
 backend info, committed rows, durable batch and row ledger entry counts, ledger
 writes, and ledger lookups. This does not replace the need for S3/native
 staging soak; it documents and enforces the current PVC/shared-filesystem JSON
-staging boundary.
+staging boundary. The shared staging filesystem must provide POSIX file fsync,
+directory fsync, atomic rename, and Bolt-compatible mmap/flock semantics;
+generic NFS/RWX/object-fuse mounts are unsupported unless they explicitly
+provide those semantics.
 The follow-up review loop changed replay lookup to exact candidate batch-marker
 checks, so retained historical `.commit` files are not walked on the commit
 path; corrupt or unrelated retained marker files do not affect unrelated staged
