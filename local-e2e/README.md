@@ -16,12 +16,18 @@ failure recovery, high concurrency, and SQL readback from Iceberg.
 - `workload/main.go`: concurrent TiDB workload generator. It creates/splits
   source tables, writes deterministic successful DML, and prints exact expected
   CDC event counts.
-- `icebergread/main.go`: Iceberg REST readback helper for row counts by CDC op.
+- `icebergread/main.go`: Iceberg REST readback helper for row counts by CDC op,
+  schema inspection, and required inserted-row ID checks.
 - `tidbexec/main.go`: tiny SQL helper used by the test harness.
 - `iceberg_case_lib.sh`: shell helpers for changefeed creation, readback waits,
   staged-file counting, and log-based writer/committer ownership checks.
 - `run_s15_owner_guard.sh`: repeatable local scenario that verifies
   many-changefeed-to-one-target is rejected by the warehouse owner marker.
+- `run_s17_schema_evolution.sh`: positive local DDL scenario for supported
+  ADD, RENAME, and conservative DROP column evolution.
+- `run_m6_soak.sh`: long-running local soak harness that checks row-count
+  convergence, sample inserted-row presence, staged backlog cleanup, and the
+  target committer lease.
 - `ICEBERG_RESILIENCE_MATRIX.md`: durable scenario checklist.
 - `ICEBERG_RESILIENCE_RESULTS.md`: scenario-by-scenario evidence and final
   verification output.
@@ -201,10 +207,12 @@ Remaining intentional limitations:
 
 - Multiple changefeeds writing the same Iceberg target table are unsupported.
   The sink now records a target-owner marker under the shared warehouse and
-  rejects a second owner before appending, including across TiCDC clusters that
-  share an S3/file warehouse. The writer claims the target before exposing a
-  staged file, so a doomed same-target feed does not advance source progress or
-  leave rows for the committer. This affects S15 and S24.
+  holds a TiCDC etcd election lease for the target committer at
+  `/tidb/cdc/<cluster>/__cdc_meta__/iceberg-committer/<sha256(target)>`.
+  A second owner is rejected before appending, including across TiCDC clusters
+  that share an S3/file warehouse. The writer claims the target before exposing
+  a staged file, so a doomed same-target feed does not advance source progress
+  or leave rows for the committer. This affects S15 and S24.
 - MinIO/S3-compatible coverage exists for the owner marker through
   `run_s16_minio_owner_marker.sh`; staged files are still local/shared-path
   JSON and need follow-up before S3-native high-throughput staging. For now,
@@ -234,11 +242,15 @@ Remaining intentional limitations:
   are marked handled before cleanup, and the bounded row-ID cache is only an
   in-process optimization. Native Iceberg data-file committables remain the
   target production design.
-- Iceberg schema evolution DDL and live `CREATE TABLE` DDL are unsupported.
-  `run_s17_schema_unsupported.sh` and
-  `run_s17_create_table_unsupported.sh` verify that live DDL is rejected
-  explicitly instead of silently producing partial semantics. Bootstrap/not-sync
-  create DDL is still allowed.
+- Iceberg schema evolution supports safe ADD COLUMN, RENAME COLUMN, and
+  compatible type-widening updates through Iceberg schema transactions.
+  DROP COLUMN is conservative: newly dropped TiDB columns stop being required
+  in row payloads, but the existing nullable Iceberg fields are retained for
+  historical rows. `run_s17_schema_evolution.sh` verifies the positive path.
+  Live `CREATE TABLE`, `TRUNCATE`, table rename/drop, and unsafe narrowing DDL
+  are still rejected explicitly. Bootstrap/not-sync create DDL is still allowed,
+  and `run_s17_schema_unsupported.sh` plus
+  `run_s17_create_table_unsupported.sh` cover the rejection path.
 - Iceberg tables are created from TiDB `TableInfo`, with `dt` and `hr` identity
   partition fields. Snapshot summaries use `ticdc.commit-barrier-ts`; the older
   `ticdc.checkpoint-ts` name is not emitted.
@@ -304,9 +316,11 @@ local-e2e/run_s09_catalog_outage_recovery.sh
 local-e2e/run_s11_append_error_replay.sh
 local-e2e/run_s12_high_volume_drain.sh
 local-e2e/run_s15_owner_guard.sh
+local-e2e/run_s17_schema_evolution.sh
 local-e2e/run_s17_create_table_unsupported.sh
 local-e2e/run_s17_schema_unsupported.sh
 local-e2e/run_s20_rolling_restart.sh
+local-e2e/run_m6_soak.sh
 ```
 
 The S3-compatible warehouse owner-marker coverage uses the local MinIO service:

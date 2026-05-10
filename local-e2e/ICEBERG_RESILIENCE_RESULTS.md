@@ -67,7 +67,7 @@ stable across replayed keyed rows even when TiCDC omits raw `RowKey` bytes.
 | S12 | High-volume staged-batch drain | PASS | `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0` | Reran at the prior high-volume size; local REST catalog drained fully. |
 | S15 | Two changefeeds writing the same Iceberg target table | UNSUPPORTED / REJECTED | `S15_OWNER_PASS cf_left=s15-owner-left-1778391469 cf_right=s15-owner-right-1778391469 summary=rows=70 inserts=60 updates=6 deletes=4 left_state=normal right_state=warning conflicts=9 metric_conflicts=3 staged_during=0 staged_after_remove=0 owner_markers_after_remove=0` | Same-target writes remain intentionally banned by the shared warehouse target-owner marker. The losing writer now fails before exposing staged rows. |
 | S16 | S3-compatible target-owner marker | PASS | `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778388358` | Verifies the cross-cluster owner fence works through the S3/MinIO external storage path. |
-| S17 | Iceberg schema evolution DDL and live CREATE TABLE DDL | UNSUPPORTED / REJECTED | `S17_SCHEMA_UNSUPPORTED_PASS cf=s17-unsupported-1778391453 rule=ice_s17_unsupported_1778391453.orders ddl=ALTER TABLE ice_s17_unsupported_1778391453.orders ADD COLUMN extra VARCHAR(32) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`; `S17_CREATE_TABLE_UNSUPPORTED_PASS cf=s17-create-unsupported-1778391432 rule=ice_s17_create_1778391432.* ddl=CREATE TABLE ice_s17_create_1778391432.orders_created (...) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0` | Live DDL is rejected explicitly instead of being treated as partial schema evolution. Bootstrap/not-sync create DDL remains allowed. |
+| S17 | Iceberg schema evolution DDL and live CREATE TABLE DDL | PARTIAL / POSITIVE SCHEMA EVOLUTION | New harness `run_s17_schema_evolution.sh` covers safe ADD, RENAME, and conservative DROP column evolution with Iceberg schema readback. Focused unit coverage verifies supported DDL dispatch, metadata-only index DDL, and unsafe type-narrowing rejection. `run_s17_schema_unsupported.sh` and `run_s17_create_table_unsupported.sh` now cover TRUNCATE and live CREATE rejection. | TiCDC applies Iceberg schema transactions for safe column changes. DROP retains nullable Iceberg fields for historical rows. Live table lifecycle DDL remains rejected until the target-level DDL protocol is production-ready. |
 | S19 | Duplicate detection/idempotency under replay | PASS / COVERED | Covered by fresh S03, S05, and S11 passes. | The duplicate replay windows now have repeatable local scripts. |
 | S20 | Long-running rolling TiCDC hard-restart loop | PASS | `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0` | Rolling restart duplicate inserts were fixed by stable keyed-row fallback IDs. |
 
@@ -122,3 +122,21 @@ Fresh local e2e reruns after the ledger and metrics patch:
   `ticdc_sink_iceberg_committed_ledger_writes_total`.
 - Shared staging cleanup after changefeed removal had `0` staged JSON files,
   `0` committed ledger marker files, and `0` target-owner marker files.
+
+## 2026-05-10 TiCDC Big-Feature Review Closure
+
+The latest review loop added target committer leases in TiCDC etcd, takeover
+orphan reconciliation, safe Iceberg column schema evolution, rich TiDB-to-Iceberg
+type mapping, REST catalog transport knobs, negative lag accounting, and
+commit-conflict retry coverage.
+
+Fresh focused evidence added by this loop:
+
+- `TestClaimTargetOwnerPublishesEtcdCommitterLease`
+- `TestClaimTargetOwnerRunsTakeoverReconciliationOnce`
+- `TestClaimTargetOwnerRevalidatesCachedWarehouseMarker`
+- `TestCanPromoteIcebergTypeRejectsNarrowingDDL`
+- `TestWriteBlockEventAppliesSupportedColumnDDL`
+- `TestWriteBlockEventTreatsIndexDDLAsMetadataOnly`
+- `run_s17_schema_evolution.sh`
+- `run_m6_soak.sh`

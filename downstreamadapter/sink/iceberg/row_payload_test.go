@@ -14,7 +14,9 @@
 package iceberg
 
 import (
+	"math"
 	"testing"
+	"time"
 
 	"github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
@@ -131,6 +133,34 @@ func TestBuildPayloadRowsDistinguishesIdenticalRowsInSameEvent(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 2)
 	require.NotEqual(t, rows[0][stagingRowIDField], rows[1][stagingRowIDField])
+}
+
+func TestBuildPayloadRowsFormatsUnsignedBigintAndRichTypes(t *testing.T) {
+	tableInfo := newRichPayloadTestTableInfo()
+	event := newPayloadTestEvent(tableInfo, 10, 20)
+	event.RowTypes = []common.RowType{common.RowTypeInsert}
+	event.Length = 1
+	event.Rows = chunk.NewChunkWithCapacity(tableInfo.GetFieldSlice(), 1)
+	event.Rows.AppendUint64(0, uint64(math.MaxInt64)+1)
+	event.Rows.AppendMyDecimal(1, types.NewDecFromStringForTest("123456789012.3456"))
+	event.Rows.AppendTime(2, types.NewTime(types.FromDate(2026, 5, 10, 0, 0, 0, 0), mysql.TypeDate, 0))
+	event.Rows.AppendTime(3, types.NewTime(types.FromDate(2026, 5, 10, 12, 34, 56, 123456), mysql.TypeDatetime, 6))
+	event.Rows.AppendTime(4, types.NewTime(types.FromDate(2026, 5, 10, 12, 34, 56, 123456), mysql.TypeTimestamp, 6))
+	event.Rows.AppendDuration(5, types.Duration{Duration: time.Hour + 2*time.Minute + 3*time.Second + 456*time.Microsecond, Fsp: 6})
+	event.Rows.AppendBytes(6, []byte{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})
+
+	rows, err := buildPayloadRows(event)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	data := rows[0]["data"].(map[string]any)
+
+	require.Equal(t, "9223372036854775808", data["u64"])
+	require.Equal(t, "123456789012.3456", data["amount"])
+	require.Equal(t, "2026-05-10", data["created_date"])
+	require.Equal(t, "2026-05-10 12:34:56.123456", data["event_time"])
+	require.Equal(t, "2026-05-10T12:34:56.123456Z", data["created_at"])
+	require.Equal(t, int64(3723000456), data["duration"])
+	require.Equal(t, []byte{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}, data["wide_bit"])
 }
 
 func newPayloadTestTableInfo() *common.TableInfo {

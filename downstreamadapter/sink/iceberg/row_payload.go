@@ -16,6 +16,7 @@ package iceberg
 import (
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/pingcap/ticdc/pkg/common"
@@ -26,6 +27,8 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 )
+
+const timestampMicroUTCLayout = "2006-01-02T15:04:05.000000Z"
 
 func buildPayloadRows(event *commonEvent.DMLEvent) ([]map[string]any, error) {
 	if event == nil || event.TableInfo == nil {
@@ -44,7 +47,7 @@ func buildPayloadRows(event *commonEvent.DMLEvent) ([]map[string]any, error) {
 
 		payload := map[string]any{
 			"_commit_ts": int64(event.CommitTs),
-			"_commit_dt": commitTime(event.CommitTs).Format(time.RFC3339Nano),
+			"_commit_dt": commitTime(event.CommitTs).Format(timestampMicroUTCLayout),
 			"_start_ts":  int64(event.StartTs),
 			"_seq":       int64(event.Seq),
 			"_table_id":  event.PhysicalTableID,
@@ -216,9 +219,12 @@ func columnValue(row *chunk.Row, idx int, col *timodel.ColumnInfo) (any, error) 
 		}
 		return row.GetString(idx), nil
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeNewDate, mysql.TypeTimestamp:
+		if col.GetType() == mysql.TypeTimestamp {
+			return formatTimestampUTC(row.GetTime(idx))
+		}
 		return row.GetTime(idx).String(), nil
 	case mysql.TypeDuration:
-		return row.GetDuration(idx, col.GetDecimal()).String(), nil
+		return row.GetDuration(idx, col.GetDecimal()).Duration.Microseconds(), nil
 	case mysql.TypeEnum:
 		enumValue := row.GetEnum(idx).Value
 		enumVar, err := types.ParseEnumValue(col.GetElems(), enumValue)
@@ -235,11 +241,20 @@ func columnValue(row *chunk.Row, idx int, col *timodel.ColumnInfo) (any, error) 
 		return setVar.Name, nil
 	case mysql.TypeBit:
 		d := row.GetDatum(idx, &col.FieldType)
-		value, err := d.GetBinaryLiteral().ToInt(types.DefaultStmtNoWarningContext)
+		literal := d.GetBinaryLiteral()
+		if col.GetFlen() >= 64 {
+			return []byte(literal), nil
+		}
+		value, err := literal.ToInt(types.DefaultStmtNoWarningContext)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		return value, nil
+		return int64(value), nil
+	case mysql.TypeLonglong:
+		if mysql.HasUnsignedFlag(col.GetFlag()) {
+			return strconv.FormatUint(row.GetUint64(idx), 10), nil
+		}
+		return row.GetInt64(idx), nil
 	case mysql.TypeNewDecimal:
 		return row.GetMyDecimal(idx).String(), nil
 	case mysql.TypeJSON:
@@ -258,4 +273,12 @@ func columnValue(row *chunk.Row, idx int, col *timodel.ColumnInfo) (any, error) 
 
 func commitTime(ts uint64) time.Time {
 	return time.UnixMilli(int64(ts >> 18)).UTC()
+}
+
+func formatTimestampUTC(t types.Time) (string, error) {
+	goTime, err := t.GoTime(time.UTC)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	return goTime.UTC().Format(timestampMicroUTCLayout), nil
 }

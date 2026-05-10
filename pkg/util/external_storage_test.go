@@ -58,9 +58,12 @@ func (m *mockExternalStorage) Close() {}
 
 type mockStrongExternalStorage struct {
 	mockExternalStorage
+	marked bool
 }
 
-func (m *mockStrongExternalStorage) MarkStrongConsistency() {}
+func (m *mockStrongExternalStorage) MarkStrongConsistency() {
+	m.marked = true
+}
 
 // WriteFile simulates a write operation by making an HTTP request that respects context cancellation.
 func (m *mockExternalStorage) WriteFile(ctx context.Context, name string, data []byte) error {
@@ -142,9 +145,12 @@ func TestExtStorageWithTimeoutWriteFileSuccess(t *testing.T) {
 }
 
 func TestWrapExternalStorageWithTimeoutPreservesStrongConsistencyMarker(t *testing.T) {
-	strongStore := wrapExternalStorageWithTimeout(&mockStrongExternalStorage{}, time.Second)
-	_, ok := strongStore.(storage.StrongConsistency)
+	underlying := &mockStrongExternalStorage{}
+	strongStore := wrapExternalStorageWithTimeout(underlying, time.Second)
+	strong, ok := strongStore.(storage.StrongConsistency)
 	require.True(t, ok)
+	strong.MarkStrongConsistency()
+	require.True(t, underlying.marked)
 
 	weakStore := wrapExternalStorageWithTimeout(&mockExternalStorage{}, time.Second)
 	_, ok = weakStore.(storage.StrongConsistency)

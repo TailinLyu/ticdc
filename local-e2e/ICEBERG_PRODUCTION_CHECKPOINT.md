@@ -11,12 +11,16 @@ matrix.
 - The v1 product contract is an append-only CDC log sink. It does not model
   Iceberg as the current TiDB table image.
 - Many-changefeed-to-one-Iceberg-target is unsupported for now.
-- The sink enforces that decision with a shared warehouse target-owner marker:
+- The sink enforces that decision with both a TiCDC etcd committer lease and a
+  shared warehouse target-owner marker. The etcd key is
+  `/tidb/cdc/<cluster>/__cdc_meta__/iceberg-committer/<sha256(identifier)>`;
+  the warehouse marker is
   `<warehouse>/.ticdc/iceberg-target-owners/<sha256(identifier)>.lock`.
 - The owner identity is:
   `cdc-cluster=<ticdc cluster id>;upstream=<upstream TiDB/PD cluster id>;changefeed=<keyspace/changefeed>`.
-- The marker lives in the warehouse, so clusters sharing an S3/file warehouse see
-  the same target ownership fence.
+- The etcd lease handles fast single-cluster failover and release on capture
+  session loss. The marker lives in the warehouse, so clusters sharing an
+  S3/file warehouse see the same target ownership fence.
 - TiCDC also writes owner metadata into Iceberg table properties and snapshot
   properties for audit and defense in depth.
 - Target warehouses are locked to local paths, `file://`, and `s3://`
@@ -66,8 +70,8 @@ matrix.
 - The sink exposes Iceberg operator metrics for staged files/rows/bytes, oldest
   staged age, commit latency/result, committed batch and row counts, durable
   batch and row ledger entries/writes/lookups, staging backend,
-  commit-barrier lag, append failures, cleanup failures, and target-owner
-  conflicts.
+  commit-barrier lag, negative commit-barrier lag observations, append failures,
+  cleanup failures, and target-owner conflicts.
 - Replayed DML row IDs are stable across processor restart splits when TiCDC
   does not populate raw `RowKey`: the sink falls back to the table primary/handle
   key and only uses row index for tables without a usable logical key.
@@ -80,9 +84,13 @@ matrix.
   bounded per-target row-ID cache remains as an in-process optimization, not the
   correctness boundary. The durable long-term answer remains Iceberg-native
   committables with a target-level commit protocol.
-- Iceberg schema evolution DDL and live `CREATE TABLE` DDL are explicitly
-  unsupported for now. Bootstrap/not-sync create DDL remains allowed. Unsupported
-  live DDL fails the changefeed instead of silently producing partial semantics.
+- Iceberg schema evolution supports safe ADD COLUMN, RENAME COLUMN, and
+  compatible type-widening updates through Iceberg schema transactions.
+  DROP COLUMN is conservative: TiCDC stops requiring the column in new row
+  payloads, but keeps the existing nullable Iceberg field so historical rows
+  remain readable. Live `CREATE TABLE`, `TRUNCATE`, table rename/drop, and
+  unsafe type narrowing are explicitly rejected. Bootstrap/not-sync create DDL
+  remains allowed.
 - Iceberg snapshots use `ticdc.commit-barrier-ts` for the advertised barrier
   contract. The older `ticdc.checkpoint-ts` property is no longer emitted.
 - New tables are created from TiDB `TableInfo`, not from the first non-null
@@ -92,6 +100,7 @@ matrix.
 
 - Focused unit and helper packages:
   - `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1`
+  - `go test ./downstreamadapter/sink/iceberg -run 'TestClaimTargetOwnerPublishesEtcdCommitterLease|TestClaimTargetOwnerRunsTakeoverReconciliationOnce|TestClaimTargetOwnerRevalidatesCachedWarehouseMarker|TestCanPromoteIcebergTypeRejectsNarrowingDDL|TestWriteBlockEvent(AppliesSupportedColumnDDL|TreatsIndexDDLAsMetadataOnly)' -count=1`
   - Focused durable-ledger/metrics regression tests cover snapshot-history
     expiration dedupe, delayed partial-overlap replay after cleanup,
     5k-row row-ledger segment/index cardinality, retained-history row miss
@@ -118,7 +127,15 @@ matrix.
   - `S15_OWNER_PASS cf_left=s15-owner-left-1778391469 cf_right=s15-owner-right-1778391469 summary=rows=70 inserts=60 updates=6 deletes=4 left_state=normal right_state=warning conflicts=9 metric_conflicts=3 staged_during=0 staged_after_remove=0 owner_markers_after_remove=0`
   - `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778388358`
   - `S17_CREATE_TABLE_UNSUPPORTED_PASS cf=s17-create-unsupported-1778391432 rule=ice_s17_create_1778391432.* ddl=CREATE TABLE ice_s17_create_1778391432.orders_created (...) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`
-  - `S17_SCHEMA_UNSUPPORTED_PASS cf=s17-unsupported-1778391453 rule=ice_s17_unsupported_1778391453.orders ddl=ALTER TABLE ice_s17_unsupported_1778391453.orders ADD COLUMN extra VARCHAR(32) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`
+  - The schema-unsupported harness now covers `TRUNCATE`; the previous
+    ADD-COLUMN rejection evidence is superseded by positive schema-evolution
+    coverage.
+- New review-closure local scripts:
+  - `local-e2e/run_s17_schema_evolution.sh` verifies safe ADD/RENAME/DROP
+    column schema evolution and schema readback.
+  - `local-e2e/run_m6_soak.sh` verifies a long-running row-count convergence
+    loop, required inserted-row samples, staged backlog cleanup, and the target
+    committer lease.
 - Metadata check on `ice_s03_replay_1778391385.orders_cdc`:
   - partition spec is `identity(dt)` and `identity(hr)`;
   - snapshots contain `ticdc.commit-barrier-ts`;
@@ -131,9 +148,11 @@ matrix.
   `local-e2e/run_s12_high_volume_drain.sh`,
   `local-e2e/run_s15_owner_guard.sh`,
   `local-e2e/run_s16_minio_owner_marker.sh`,
+  `local-e2e/run_s17_schema_evolution.sh`,
   `local-e2e/run_s17_create_table_unsupported.sh`,
   `local-e2e/run_s17_schema_unsupported.sh`, and
-  `local-e2e/run_s20_rolling_restart.sh`.
+  `local-e2e/run_s20_rolling_restart.sh`. The longer soak command is
+  `local-e2e/run_m6_soak.sh`.
 
 ## Remaining Production Hardening Loop
 
@@ -141,9 +160,9 @@ matrix.
   mature cloud/external-storage writer path where possible instead of inventing a
   separate high-throughput file pipeline. This is still the next architecture
   loop before calling the sink production-shape for high throughput.
-- Add a real per-Iceberg-target commit coordinator if many-source or
+- Add a real per-Iceberg-target data-file commit coordinator if many-source or
   many-changefeed-to-one-target must become supported. Until then, keep the
-  warehouse owner marker as a hard rejection.
+  etcd lease plus warehouse owner marker as a hard rejection.
 - Add alert rules, dashboard panels, and a runbook on top of the new metrics.
   The minimum alerts for this PR are non-zero
   `ticdc_sink_iceberg_committed_ledger_writes_total{result="error"}`,
@@ -166,9 +185,9 @@ matrix.
   tables, aggressive checkpoint cadence, catalog outage/recovery, and staged
   backlog drain limits. A single laptop cannot prove 30GB/s, but it can catch
   algorithmic O(N) and unbounded backlog behavior.
-- Keep ADD/DROP/RENAME/TRUNCATE DDL unsupported until the DDL barrier and Iceberg
-  schema-update protocol are implemented. The current local check verifies the
-  rejection path, not schema evolution support.
+- Keep table lifecycle DDL unsupported until the DDL barrier and target-level
+  commit protocol cover create/truncate/rename/drop semantics. Current schema
+  evolution support is intentionally limited to safe column changes.
 
 ## Design Comparison Notes
 

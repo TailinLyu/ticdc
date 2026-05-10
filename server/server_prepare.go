@@ -137,6 +137,8 @@ func (c *server) prepare(ctx context.Context) error {
 	// TODO: Get id from disk after restart.
 	c.info = node.NewInfo(conf.AdvertiseAddr, deployPath)
 	c.session = session
+	appctx.SetService(appctx.EtcdClient, c.EtcdClient)
+	appctx.SetService(appctx.EtcdSession, c.session)
 	return nil
 }
 

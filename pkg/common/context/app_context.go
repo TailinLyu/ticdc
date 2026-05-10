@@ -38,6 +38,8 @@ const (
 	PDAPIClient             = "PDAPIClient"
 	RegionCache             = "RegionCache"
 	KeyspaceManager         = "keyspaceManager"
+	EtcdClient              = "EtcdClient"
+	EtcdSession             = "EtcdSession"
 )
 
 // Put all the global instances here.
@@ -63,3 +65,13 @@ func GetService[T any](name string) T {
 	v, _ := GetGlobalContext().serviceMap.Load(name)
 	return v.(T)
 }
+func GetServiceIfExists[T any](name string) (T, bool) {
+	v, ok := GetGlobalContext().serviceMap.Load(name)
+	if !ok {
+		var zero T
+		return zero, false
+	}
+	typed, ok := v.(T)
+	return typed, ok
+}
+func DeleteService(name string) { GetGlobalContext().serviceMap.Delete(name) }

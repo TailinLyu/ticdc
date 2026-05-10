@@ -10,7 +10,7 @@ Full evidence is in `local-e2e/ICEBERG_RESILIENCE_RESULTS.md`.
 
 | ID | Status | What failed | Evidence | Root cause / interpretation |
 | --- | --- | --- | --- | --- |
-| S15 | UNSUPPORTED / REJECTED | Two changefeeds writing the same Iceberg target table. | Fresh rebuilt-image run: `S15_OWNER_PASS cf_left=s15-owner-left-1778391469 cf_right=s15-owner-right-1778391469 summary=rows=70 inserts=60 updates=6 deletes=4 left_state=normal right_state=warning conflicts=9 metric_conflicts=3 staged_during=0 staged_after_remove=0 owner_markers_after_remove=0`. | The first owner claims the target in the shared warehouse before the staged file is visible; the second owner is rejected before append or source progress. This intentionally bans many-changefeed-to-one-target, including across clusters sharing S3/file warehouse storage. |
+| S15 | UNSUPPORTED / REJECTED | Two changefeeds writing the same Iceberg target table. | Fresh rebuilt-image run: `S15_OWNER_PASS cf_left=s15-owner-left-1778391469 cf_right=s15-owner-right-1778391469 summary=rows=70 inserts=60 updates=6 deletes=4 left_state=normal right_state=warning conflicts=9 metric_conflicts=3 staged_during=0 staged_after_remove=0 owner_markers_after_remove=0`; focused unit coverage now verifies the etcd committer lease. | The first owner claims the target in TiCDC etcd and the shared warehouse before the staged file is visible; the second owner is rejected before append or source progress. This intentionally bans many-changefeed-to-one-target, including across clusters sharing S3/file warehouse storage. |
 | S24 | UNSUPPORTED / CONFIG_LIMITATION | many:1 mapping into one Iceberg target. | Same-target changefeeds are now rejected by the shared warehouse owner marker; different source table names still cannot be routed to one Iceberg table by current config. | Supporting true many-source-table-to-one-target would require target-identifier override/routing plus a target-table-level commit protocol. Until then, this shape is explicitly unsupported. |
 
 ## Current Partial Or Semantic-Limit Scenarios
@@ -18,7 +18,7 @@ Full evidence is in `local-e2e/ICEBERG_RESILIENCE_RESULTS.md`.
 | ID | Status | What was limited | Evidence | Interpretation |
 | --- | --- | --- | --- | --- |
 | S16 | PARTIAL | Move/split/merge scheduler operations while writing. | Split and merge succeeded; `move-split-table` returned `ErrOperatorIsNil`; after merge to one replication, `move-table` succeeded and counts stayed exact. | Data correctness was fine, but one scheduler operation did not work in this local setup. |
-| S17 | UNSUPPORTED / REJECTED | Iceberg schema evolution DDL and live CREATE TABLE DDL. | Fresh rebuilt-image runs: `S17_SCHEMA_UNSUPPORTED_PASS cf=s17-unsupported-1778391453 rule=ice_s17_unsupported_1778391453.orders ddl=ALTER TABLE ice_s17_unsupported_1778391453.orders ADD COLUMN extra VARCHAR(32) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`; `S17_CREATE_TABLE_UNSUPPORTED_PASS cf=s17-create-unsupported-1778391432 rule=ice_s17_create_1778391432.* ddl=CREATE TABLE ice_s17_create_1778391432.orders_created (...) summary=rows=58 inserts=50 updates=5 deletes=3 staged_before_ddl=0 state=warning staged_after_remove=0`. | ADD/DROP/RENAME/TRUNCATE and live CREATE TABLE style DDL are now treated as unsupported instead of silently producing partial Iceberg semantics. Bootstrap/not-sync create DDL remains allowed. Production schema evolution still requires a DDL barrier and Iceberg schema-update protocol. |
+| S17 | PARTIAL / POSITIVE SCHEMA EVOLUTION | Supported ADD, RENAME, and conservative DROP column DDL now have a positive local harness; destructive live table DDL remains rejected. | `run_s17_schema_evolution.sh` verifies Iceberg schema readback after ADD/RENAME/DROP. Focused unit coverage verifies supported DDL dispatch and unsafe type-narrowing rejection. The previous unsupported scripts now cover live `CREATE TABLE` and `TRUNCATE` rejection. | TiCDC now applies Iceberg schema transactions for safe column evolution. DROP is intentionally conservative and retains nullable Iceberg fields for historical rows. Live CREATE/TRUNCATE/table lifecycle DDL still needs a stronger target protocol and remains rejected. |
 
 ## Resolved In Current Loop
 
@@ -61,5 +61,5 @@ Iceberg-native committables:
 - parallel writers produce data-file committables rather than JSON batches,
 - one target-level committer atomically commits those files to Iceberg,
 - unsupported many-to-one targets stay rejected until that coordinator exists,
-- schema evolution remains unsupported until a DDL barrier and Iceberg schema
-  update protocol are implemented.
+- the current schema evolution support stays limited to safe ADD/RENAME/DROP
+  column changes until a fuller DDL protocol covers table lifecycle semantics.

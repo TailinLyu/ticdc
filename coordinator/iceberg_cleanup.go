@@ -25,6 +25,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// cleanupRemovedChangefeedSinkArtifacts removes Iceberg-only local staging and
+// warehouse owner markers after a changefeed is deleted. Non-Iceberg sinks must
+// remain a no-op so generic changefeed cleanup stays protocol agnostic.
 func cleanupRemovedChangefeedSinkArtifacts(id common.ChangeFeedID, sinkURI string, upstreamID uint64) {
 	parsedURI, err := url.Parse(sinkURI)
 	if err != nil {

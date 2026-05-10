@@ -14,6 +14,8 @@
 package etcd
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -108,6 +110,14 @@ type CDCKey struct {
 // Ref: https://github.com/pingcap/tidb-dashboard/blob/1f39ee09c5352adbf23af8ec7e15020147ef9ca4/pkg/utils/topology/ticdc.go#L22
 func BaseKey(clusterID string) string {
 	return fmt.Sprintf("/tidb/cdc/%s", clusterID)
+}
+
+// IcebergCommitterElectionKey is the per-Iceberg-target committer election
+// prefix. The target key is hashed so arbitrary database/table identifiers do
+// not become raw etcd path bytes.
+func IcebergCommitterElectionKey(clusterID string, targetKey string) string {
+	sum := sha256.Sum256([]byte(targetKey))
+	return BaseKey(clusterID) + metaPrefix + "/iceberg-committer/" + hex.EncodeToString(sum[:])
 }
 
 // NewCDCBaseKey is used for keys added by New Arch TiCDC

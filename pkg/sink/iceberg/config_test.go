@@ -22,7 +22,7 @@ import (
 )
 
 func TestParseConfigFromSinkURI(t *testing.T) {
-	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&staging-dir=file:///tmp/ticdc-stage&database-prefix=tidb_&table-suffix=_log&commit-interval=2s&batch-rows=64")
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&staging-dir=file:///tmp/ticdc-stage&database-prefix=tidb_&table-suffix=_log&commit-interval=2s&batch-rows=64&catalog-host-header=catalog.internal&suppress-headers=X-Iceberg-Access-Delegation, X-Test&aws-region=us-west-2&aws-user-agent=ticdc-iceberg-test")
 	require.NoError(t, err)
 
 	cfg, err := ParseConfig(uri)
@@ -35,6 +35,10 @@ func TestParseConfigFromSinkURI(t *testing.T) {
 	require.Equal(t, "_log", cfg.TableSuffix)
 	require.Equal(t, 2*time.Second, cfg.CommitInterval)
 	require.Equal(t, 64, cfg.BatchRows)
+	require.Equal(t, "catalog.internal", cfg.CatalogHostHeader)
+	require.Equal(t, []string{"X-Iceberg-Access-Delegation", "X-Test"}, cfg.SuppressHeaders)
+	require.Equal(t, "us-west-2", cfg.AWSRegion)
+	require.Equal(t, "ticdc-iceberg-test", cfg.AWSUserAgent)
 }
 
 func TestParseConfigAllowsExplicitCatalogURI(t *testing.T) {

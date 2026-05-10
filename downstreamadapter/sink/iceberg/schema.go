@@ -31,14 +31,21 @@ type stagedColumnType string
 const (
 	stagedColumnTypeBinary  stagedColumnType = "binary"
 	stagedColumnTypeBool    stagedColumnType = "bool"
+	stagedColumnTypeDate    stagedColumnType = "date"
+	stagedColumnTypeDecimal stagedColumnType = "decimal"
 	stagedColumnTypeFloat64 stagedColumnType = "float64"
 	stagedColumnTypeInt64   stagedColumnType = "int64"
 	stagedColumnTypeString  stagedColumnType = "string"
+	stagedColumnTypeTime    stagedColumnType = "time"
+	stagedColumnTypeTS      stagedColumnType = "timestamp"
+	stagedColumnTypeTSZ     stagedColumnType = "timestamptz"
 )
 
 type stagedColumnSchema struct {
-	Name string           `json:"name"`
-	Type stagedColumnType `json:"type"`
+	Name      string           `json:"name"`
+	Type      stagedColumnType `json:"type"`
+	Precision int32            `json:"precision,omitempty"`
+	Scale     int32            `json:"scale,omitempty"`
 }
 
 type stagedTableSchema struct {
@@ -62,7 +69,7 @@ func arrowSchemaForStagedTableSchema(tableSchema *stagedTableSchema) *arrow.Sche
 func cdcLogArrowSchema(rowType arrow.DataType) *arrow.Schema {
 	return arrow.NewSchema([]arrow.Field{
 		{Name: "_commit_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-		{Name: "_commit_dt", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "_commit_dt", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: false},
 		{Name: "_start_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "_seq", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "_table_id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
@@ -83,10 +90,7 @@ func stagedTableSchemaForTableInfo(tableInfo *common.TableInfo) *stagedTableSche
 		if col.IsVirtualGenerated() {
 			continue
 		}
-		columns = append(columns, stagedColumnSchema{
-			Name: col.Name.O,
-			Type: stagedColumnTypeForColumn(col),
-		})
+		columns = append(columns, stagedColumnSchemaForColumn(col))
 	}
 	return &stagedTableSchema{Columns: columns}
 }
@@ -108,7 +112,7 @@ func rowStructTypeForTableSchema(tableSchema *stagedTableSchema) arrow.DataType 
 	}
 	fields := make([]arrow.Field, 0, len(tableSchema.Columns))
 	for _, col := range tableSchema.Columns {
-		fields = append(fields, arrow.Field{Name: col.Name, Type: arrowTypeForStagedColumn(col.Type), Nullable: true})
+		fields = append(fields, arrow.Field{Name: col.Name, Type: arrowTypeForStagedColumn(col), Nullable: true})
 	}
 	return arrow.StructOf(fields...)
 }
@@ -142,6 +146,21 @@ func rowStructType(rows []map[string]any, fieldNames ...string) arrow.DataType {
 	return arrow.StructOf(fields...)
 }
 
+func stagedColumnSchemaForColumn(col *timodel.ColumnInfo) stagedColumnSchema {
+	schema := stagedColumnSchema{
+		Name: col.Name.O,
+		Type: stagedColumnTypeForColumn(col),
+	}
+	if schema.Type == stagedColumnTypeDecimal {
+		precision, scale, ok := decimalPrecisionScale(col)
+		if ok {
+			schema.Precision = precision
+			schema.Scale = scale
+		}
+	}
+	return schema
+}
+
 func stagedColumnTypeForColumn(col *timodel.ColumnInfo) stagedColumnType {
 	switch col.GetType() {
 	case mysql.TypeVarchar, mysql.TypeString, mysql.TypeVarString,
@@ -152,32 +171,107 @@ func stagedColumnTypeForColumn(col *timodel.ColumnInfo) stagedColumnType {
 		return stagedColumnTypeString
 	case mysql.TypeFloat, mysql.TypeDouble:
 		return stagedColumnTypeFloat64
-	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong,
-		mysql.TypeYear, mysql.TypeBit:
+	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24, mysql.TypeLong, mysql.TypeYear:
 		return stagedColumnTypeInt64
-	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeNewDate, mysql.TypeTimestamp,
-		mysql.TypeDuration, mysql.TypeEnum, mysql.TypeSet, mysql.TypeNewDecimal,
-		mysql.TypeJSON, mysql.TypeTiDBVectorFloat32:
+	case mysql.TypeLonglong:
+		if mysql.HasUnsignedFlag(col.GetFlag()) {
+			return stagedColumnTypeString
+		}
+		return stagedColumnTypeInt64
+	case mysql.TypeBit:
+		if col.GetFlen() >= 64 {
+			return stagedColumnTypeBinary
+		}
+		return stagedColumnTypeInt64
+	case mysql.TypeDate, mysql.TypeNewDate:
+		return stagedColumnTypeDate
+	case mysql.TypeDatetime:
+		return stagedColumnTypeTS
+	case mysql.TypeTimestamp:
+		return stagedColumnTypeTSZ
+	case mysql.TypeDuration:
+		return stagedColumnTypeTime
+	case mysql.TypeNewDecimal:
+		if _, _, ok := decimalPrecisionScale(col); ok {
+			return stagedColumnTypeDecimal
+		}
+		return stagedColumnTypeString
+	case mysql.TypeEnum, mysql.TypeSet, mysql.TypeJSON, mysql.TypeTiDBVectorFloat32:
 		return stagedColumnTypeString
 	default:
 		return stagedColumnTypeString
 	}
 }
 
-func arrowTypeForStagedColumn(columnType stagedColumnType) arrow.DataType {
-	switch columnType {
+func decimalPrecisionScale(col *timodel.ColumnInfo) (int32, int32, bool) {
+	precision := col.GetFlen()
+	scale := col.GetDecimal()
+	if scale < 0 {
+		scale = 0
+	}
+	if precision <= 0 {
+		precision = 38
+	}
+	if scale > precision {
+		precision = scale
+	}
+	if precision > 38 {
+		return 0, 0, false
+	}
+	return int32(precision), int32(scale), true
+}
+
+func arrowTypeForStagedColumn(column stagedColumnSchema) arrow.DataType {
+	switch column.Type {
 	case stagedColumnTypeBinary:
 		return arrow.BinaryTypes.Binary
 	case stagedColumnTypeBool:
 		return arrow.FixedWidthTypes.Boolean
+	case stagedColumnTypeDate:
+		return arrow.FixedWidthTypes.Date32
+	case stagedColumnTypeDecimal:
+		return &arrow.Decimal128Type{Precision: column.Precision, Scale: column.Scale}
 	case stagedColumnTypeFloat64:
 		return arrow.PrimitiveTypes.Float64
 	case stagedColumnTypeInt64:
 		return arrow.PrimitiveTypes.Int64
 	case stagedColumnTypeString:
 		return arrow.BinaryTypes.String
+	case stagedColumnTypeTime:
+		return &arrow.Time64Type{Unit: arrow.Microsecond}
+	case stagedColumnTypeTS:
+		return &arrow.TimestampType{Unit: arrow.Microsecond}
+	case stagedColumnTypeTSZ:
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
 	default:
 		return arrow.BinaryTypes.String
+	}
+}
+
+func icebergTypeForStagedColumn(column stagedColumnSchema) iceberggo.Type {
+	switch column.Type {
+	case stagedColumnTypeBinary:
+		return iceberggo.PrimitiveTypes.Binary
+	case stagedColumnTypeBool:
+		return iceberggo.PrimitiveTypes.Bool
+	case stagedColumnTypeDate:
+		return iceberggo.PrimitiveTypes.Date
+	case stagedColumnTypeDecimal:
+		return iceberggo.DecimalTypeOf(int(column.Precision), int(column.Scale))
+	case stagedColumnTypeFloat64:
+		return iceberggo.PrimitiveTypes.Float64
+	case stagedColumnTypeInt64:
+		return iceberggo.PrimitiveTypes.Int64
+	case stagedColumnTypeString:
+		return iceberggo.PrimitiveTypes.String
+	case stagedColumnTypeTime:
+		return iceberggo.PrimitiveTypes.Time
+	case stagedColumnTypeTS:
+		return iceberggo.PrimitiveTypes.Timestamp
+	case stagedColumnTypeTSZ:
+		return iceberggo.PrimitiveTypes.TimestampTz
+	default:
+		return iceberggo.PrimitiveTypes.String
 	}
 }
 

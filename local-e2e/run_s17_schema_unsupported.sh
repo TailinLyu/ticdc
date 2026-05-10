@@ -14,7 +14,7 @@ RUN_ID="${RUN_ID:-$(date +%s)}"
 DB="${DB:-ice_s17_unsupported_${RUN_ID}}"
 CF="${CF:-s17-unsupported-${RUN_ID}}"
 RULE="${RULE:-${DB}.orders}"
-DDL_SQL="${DDL_SQL:-ALTER TABLE ${DB}.orders ADD COLUMN extra VARCHAR(32)}"
+DDL_SQL="${DDL_SQL:-TRUNCATE TABLE ${DB}.orders}"
 PASS_LABEL="${PASS_LABEL:-S17_SCHEMA_UNSUPPORTED_PASS}"
 
 cleanup() {

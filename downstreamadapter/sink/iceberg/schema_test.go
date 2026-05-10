@@ -20,6 +20,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	iceberggo "github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
+	"github.com/pingcap/ticdc/pkg/common"
+	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	parsermodel "github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,6 +93,33 @@ func TestArrowSchemaForTableInfoIncludesColumnsWithoutObservedValues(t *testing.
 	require.Equal(t, dataType.Fields(), oldType.Fields())
 }
 
+func TestArrowSchemaForTableInfoUsesDesignRichTypes(t *testing.T) {
+	tableInfo := newRichPayloadTestTableInfo()
+
+	schema := arrowSchemaForTableInfo(tableInfo)
+
+	require.True(t, arrow.TypeEqual(
+		&arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"},
+		schema.Field(1).Type))
+	dataType := schema.Field(8).Type.(*arrow.StructType)
+	fields := dataType.Fields()
+	require.Len(t, fields, 7)
+	require.Equal(t, "u64", fields[0].Name)
+	require.True(t, arrow.TypeEqual(arrow.BinaryTypes.String, fields[0].Type))
+	require.Equal(t, "amount", fields[1].Name)
+	require.True(t, arrow.TypeEqual(&arrow.Decimal128Type{Precision: 20, Scale: 4}, fields[1].Type))
+	require.Equal(t, "created_date", fields[2].Name)
+	require.True(t, arrow.TypeEqual(arrow.FixedWidthTypes.Date32, fields[2].Type))
+	require.Equal(t, "event_time", fields[3].Name)
+	require.True(t, arrow.TypeEqual(&arrow.TimestampType{Unit: arrow.Microsecond}, fields[3].Type))
+	require.Equal(t, "created_at", fields[4].Name)
+	require.True(t, arrow.TypeEqual(&arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, fields[4].Type))
+	require.Equal(t, "duration", fields[5].Name)
+	require.True(t, arrow.TypeEqual(&arrow.Time64Type{Unit: arrow.Microsecond}, fields[5].Type))
+	require.Equal(t, "wide_bit", fields[6].Name)
+	require.True(t, arrow.TypeEqual(arrow.BinaryTypes.Binary, fields[6].Type))
+}
+
 func TestCDCLogPartitionSpecUsesDtHrIdentity(t *testing.T) {
 	icebergSchema, err := icebergtable.ArrowSchemaToIcebergWithFreshIDs(
 		arrowSchemaForTableInfo(newPayloadTestTableInfo()), false)
@@ -101,4 +133,49 @@ func TestCDCLogPartitionSpecUsesDtHrIdentity(t *testing.T) {
 	require.Equal(t, iceberggo.IdentityTransform{}, spec.Field(0).Transform)
 	require.Equal(t, "hr", spec.Field(1).Name)
 	require.Equal(t, iceberggo.IdentityTransform{}, spec.Field(1).Transform)
+}
+
+func newRichPayloadTestTableInfo() *common.TableInfo {
+	unsignedBigint := types.NewFieldType(mysql.TypeLonglong)
+	unsignedBigint.AddFlag(mysql.UnsignedFlag)
+
+	decimalType := types.NewFieldType(mysql.TypeNewDecimal)
+	decimalType.SetFlen(20)
+	decimalType.SetDecimal(4)
+
+	dateType := types.NewFieldType(mysql.TypeDate)
+	datetimeType := types.NewFieldType(mysql.TypeDatetime)
+	timestampType := types.NewFieldType(mysql.TypeTimestamp)
+
+	durationType := types.NewFieldType(mysql.TypeDuration)
+	durationType.SetDecimal(6)
+
+	bitType := types.NewFieldType(mysql.TypeBit)
+	bitType.SetFlen(64)
+
+	tableInfo := common.WrapTableInfo("app", &timodel.TableInfo{
+		ID:   202,
+		Name: parsermodel.NewCIStr("rich_types"),
+		Columns: []*timodel.ColumnInfo{
+			newColumnInfoForSchemaTest(1, "u64", unsignedBigint),
+			newColumnInfoForSchemaTest(2, "amount", decimalType),
+			newColumnInfoForSchemaTest(3, "created_date", dateType),
+			newColumnInfoForSchemaTest(4, "event_time", datetimeType),
+			newColumnInfoForSchemaTest(5, "created_at", timestampType),
+			newColumnInfoForSchemaTest(6, "duration", durationType),
+			newColumnInfoForSchemaTest(7, "wide_bit", bitType),
+		},
+	})
+	tableInfo.InitPrivateFields()
+	return tableInfo
+}
+
+func newColumnInfoForSchemaTest(id int64, name string, fieldType *types.FieldType) *timodel.ColumnInfo {
+	return &timodel.ColumnInfo{
+		ID:        id,
+		Offset:    int(id - 1),
+		Name:      parsermodel.NewCIStr(name),
+		State:     timodel.StatePublic,
+		FieldType: *fieldType,
+	}
 }

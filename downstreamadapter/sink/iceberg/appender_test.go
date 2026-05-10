@@ -15,11 +15,15 @@ package iceberg
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	iceberggo "github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
+	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
 	"github.com/stretchr/testify/require"
 )
 
@@ -83,4 +87,43 @@ func TestSnapshotCommittedBatchesForCandidatesFiltersUnrequestedHistory(t *testi
 	require.NotContains(t, committed, "batch-b")
 	require.NotContains(t, committed, "old-unrequested")
 	require.NotContains(t, committed, "missing")
+}
+
+func TestCanPromoteIcebergTypeRejectsNarrowingDDL(t *testing.T) {
+	require.True(t, canPromoteIcebergType(iceberggo.PrimitiveTypes.Int32, iceberggo.PrimitiveTypes.Int64))
+	require.True(t, canPromoteIcebergType(iceberggo.DecimalTypeOf(10, 2), iceberggo.DecimalTypeOf(12, 4)))
+	require.False(t, canPromoteIcebergType(iceberggo.PrimitiveTypes.Int64, iceberggo.PrimitiveTypes.Int32))
+	require.False(t, canPromoteIcebergType(iceberggo.DecimalTypeOf(12, 4), iceberggo.DecimalTypeOf(10, 2)))
+	require.False(t, canPromoteIcebergType(iceberggo.PrimitiveTypes.TimestampTz, iceberggo.PrimitiveTypes.Timestamp))
+}
+
+func TestNewIcebergAppenderAppliesCatalogTransportOverrides(t *testing.T) {
+	var seenHost string
+	var seenHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/config" {
+			http.NotFound(w, r)
+			return
+		}
+		seenHost = r.Host
+		seenHeaders = r.Header.Clone()
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"defaults":  map[string]any{},
+			"overrides": map[string]any{},
+		}))
+	}))
+	defer server.Close()
+
+	_, err := newIcebergAppender(context.Background(), &icebergcfg.Config{
+		CatalogURI:        server.URL,
+		Warehouse:         "file:///tmp/warehouse",
+		CatalogHostHeader: "catalog.internal",
+		SuppressHeaders:   []string{"X-Iceberg-Access-Delegation"},
+		AWSRegion:         "us-west-2",
+		AWSUserAgent:      "ticdc-iceberg-test",
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, "catalog.internal", seenHost)
+	require.Empty(t, seenHeaders.Values("X-Iceberg-Access-Delegation"))
 }

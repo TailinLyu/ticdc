@@ -42,6 +42,15 @@ type Config struct {
 	CommitInterval time.Duration
 	BatchRows      int
 
+	// Optional HTTP-level overrides for the REST catalog client. Empty values
+	// keep iceberg-go defaults.
+	CatalogHostHeader string
+	SuppressHeaders   []string
+
+	// Optional AWS SDK knobs for REST catalog SigV4/storage clients.
+	AWSRegion    string
+	AWSUserAgent string
+
 	// Runtime owner identity. These fields are filled by TiCDC after parsing
 	// the sink URI and are used to reject unsupported shared-target writes.
 	TiCDCClusterID string
@@ -67,6 +76,14 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 		TableSuffix:    firstNonEmpty(query.Get("table-suffix"), query.Get("iceberg-table-suffix"), defaultTableSuffix),
 		CommitInterval: defaultCommitInterval,
 		BatchRows:      defaultBatchRows,
+		CatalogHostHeader: strings.TrimSpace(firstNonEmpty(
+			query.Get("catalog-host-header"), query.Get("iceberg-catalog-host-header"))),
+		SuppressHeaders: splitCommaList(firstNonEmpty(
+			query.Get("suppress-headers"), query.Get("iceberg-suppress-headers"))),
+		AWSRegion: strings.TrimSpace(firstNonEmpty(
+			query.Get("aws-region"), query.Get("iceberg-aws-region"))),
+		AWSUserAgent: strings.TrimSpace(firstNonEmpty(
+			query.Get("aws-user-agent"), query.Get("iceberg-aws-user-agent"))),
 	}
 
 	if cfg.CatalogURI == "" {
@@ -132,6 +149,18 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func splitCommaList(raw string) []string {
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			values = append(values, part)
+		}
+	}
+	return values
 }
 
 func defaultStagingPath(warehouse string) (string, error) {

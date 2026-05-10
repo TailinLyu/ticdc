@@ -151,6 +151,14 @@ var (
 			Help:      "Difference between the current commit barrier TSO and the max commit TSO in the latest committed Iceberg batch.",
 		}, []string{getKeyspaceLabel(), "changefeed"})
 
+	IcebergNegativeCommitBarrierLagCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_negative_commit_barrier_lag_total",
+			Help:      "Total count of Iceberg commits whose max commit TSO is greater than the observed commit barrier TSO.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
 	IcebergCommittedLedgerEntriesGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "ticdc",
@@ -391,6 +399,7 @@ func initSinkMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(IcebergCommittedBatchesCounter)
 	registry.MustRegister(IcebergCommittedRowsCounter)
 	registry.MustRegister(IcebergCommitBarrierLagGauge)
+	registry.MustRegister(IcebergNegativeCommitBarrierLagCounter)
 	registry.MustRegister(IcebergCommittedLedgerEntriesGauge)
 	registry.MustRegister(IcebergCommittedLedgerWritesCounter)
 	registry.MustRegister(IcebergCommittedLedgerLookupsCounter)

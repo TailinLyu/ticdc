@@ -15,6 +15,7 @@ package iceberg
 
 import (
 	"context"
+	"encoding/json"
 	"net/url"
 	"os"
 	"strconv"
@@ -23,14 +24,19 @@ import (
 	"time"
 
 	iceberggo "github.com/apache/iceberg-go"
+	icebergrest "github.com/apache/iceberg-go/catalog/rest"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
+	appcontext "github.com/pingcap/ticdc/pkg/common/context"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	"github.com/pingcap/ticdc/pkg/config"
 	"github.com/pingcap/ticdc/pkg/errors"
+	"github.com/pingcap/ticdc/pkg/etcd"
 	"github.com/pingcap/ticdc/pkg/metrics"
 	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
+	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	"go.etcd.io/etcd/client/v3/concurrency"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
@@ -46,6 +52,23 @@ type appendWriter interface {
 	CommittedBatches(ctx context.Context, identifier []string, batchIDs []string) (map[string]struct{}, error)
 }
 
+type tableSchemaWriter interface {
+	ApplyTableSchema(
+		ctx context.Context,
+		identifier []string,
+		tableInfo *common.TableInfo,
+		ddlType timodel.ActionType,
+		ownerID string,
+		changefeed string,
+		cdcClusterID string,
+		upstreamID string,
+	) error
+}
+
+type targetTakeoverReconciler interface {
+	ReconcileTargetOnTakeover(ctx context.Context, identifier []string, ownerID string, changefeed string) error
+}
+
 type sink struct {
 	changefeedID common.ChangeFeedID
 	cfg          *icebergcfg.Config
@@ -58,6 +81,7 @@ type sink struct {
 	stage              *stageStore
 	isCommitter        *atomic.Bool
 	latestCheckpointTs *atomic.Uint64
+	checkpointPending  *atomic.Bool
 
 	writerMu       sync.Mutex
 	writer         appendWriter
@@ -65,6 +89,7 @@ type sink struct {
 
 	ownerClaimsMu sync.Mutex
 	ownerClaims   map[string]struct{}
+	ownerLeases   map[string]*concurrency.Election
 
 	committedRowIDsByIdentifier map[string]*committedRowIDCache
 }
@@ -135,6 +160,7 @@ const (
 	maxStagedFilesPerCommit = 100
 	maxRowsPerCommit        = 5000
 	maxCommittedRowIDCache  = maxRowsPerCommit * 4
+	maxCommitConflictRetry  = 3
 )
 
 var errIcebergTargetOwnerConflict = icebergcfg.ErrTargetOwnerConflict
@@ -180,9 +206,11 @@ func newSink(ctx context.Context, changefeedID common.ChangeFeedID, cfg *iceberg
 		stage:                       newStageStore(cfg.StagingDir),
 		isCommitter:                 atomic.NewBool(false),
 		latestCheckpointTs:          atomic.NewUint64(0),
+		checkpointPending:           atomic.NewBool(false),
 		writer:                      writer,
 		injectedWriter:              writer != nil,
 		ownerClaims:                 make(map[string]struct{}),
+		ownerLeases:                 make(map[string]*concurrency.Election),
 		committedRowIDsByIdentifier: make(map[string]*committedRowIDCache),
 	}
 }
@@ -208,10 +236,21 @@ func (s *sink) WriteBlockEvent(event commonEvent.BlockEvent) error {
 	case commonEvent.TypeSyncPointEvent:
 	case commonEvent.TypeDDLEvent:
 		ddl, ok := event.(*commonEvent.DDLEvent)
-		if !ok || !isIgnorableIcebergDDL(ddl) {
+		if !ok {
 			return errors.Errorf("iceberg sink does not support block event %s at commit ts %d",
 				commonEvent.TypeToString(event.GetType()), event.GetCommitTs())
 		}
+		if isIgnorableIcebergDDL(ddl) || isMetadataOnlyIcebergDDL(ddl.GetDDLType()) {
+			break
+		}
+		if isSchemaEvolutionIcebergDDL(ddl.GetDDLType()) {
+			if err := s.applySchemaEvolutionDDL(ddl); err != nil {
+				return errors.Trace(err)
+			}
+			break
+		}
+		return errors.Errorf("iceberg sink does not support block event %s at commit ts %d",
+			commonEvent.TypeToString(event.GetType()), event.GetCommitTs())
 	default:
 		return errors.Errorf("iceberg sink does not support block event %s at commit ts %d",
 			commonEvent.TypeToString(event.GetType()), event.GetCommitTs())
@@ -224,9 +263,81 @@ func isIgnorableIcebergDDL(event *commonEvent.DDLEvent) bool {
 	return event.IsBootstrap || event.NotSync
 }
 
+func isSchemaEvolutionIcebergDDL(action timodel.ActionType) bool {
+	switch action {
+	case timodel.ActionAddColumn,
+		timodel.ActionAddColumns,
+		timodel.ActionDropColumn,
+		timodel.ActionDropColumns,
+		timodel.ActionModifyColumn,
+		timodel.ActionMultiSchemaChange:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMetadataOnlyIcebergDDL(action timodel.ActionType) bool {
+	switch action {
+	case timodel.ActionAddIndex,
+		timodel.ActionDropIndex,
+		timodel.ActionAddPrimaryKey,
+		timodel.ActionDropPrimaryKey,
+		timodel.ActionRenameIndex,
+		timodel.ActionAlterIndexVisibility,
+		timodel.ActionSetDefaultValue,
+		timodel.ActionModifyTableComment,
+		timodel.ActionModifyTableCharsetAndCollate,
+		timodel.ActionRebaseAutoID,
+		timodel.ActionShardRowID,
+		timodel.ActionModifyTableAutoIDCache,
+		timodel.ActionRebaseAutoRandomBase,
+		timodel.ActionAlterTTLInfo,
+		timodel.ActionAlterTTLRemove:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *sink) applySchemaEvolutionDDL(ddl *commonEvent.DDLEvent) error {
+	if ddl.TableInfo == nil {
+		return errors.Errorf("iceberg schema DDL %s at commit ts %d has no table info",
+			ddl.GetDDLType().String(), ddl.GetCommitTs())
+	}
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	identifier := s.cfg.TargetIdentifier(ddl.TableInfo.GetSchemaName(), ddl.TableInfo.GetTableName())
+	if err := s.claimTargetOwner(ctx, identifier); err != nil {
+		return errors.Trace(err)
+	}
+	writer, err := s.getWriter(ctx)
+	if err != nil {
+		s.recordAppendFailure("writer_init")
+		s.resetWriter()
+		return errors.Trace(err)
+	}
+	schemaWriter, ok := writer.(tableSchemaWriter)
+	if !ok {
+		return errors.Errorf("iceberg writer %T cannot apply schema DDL %s", writer, ddl.GetDDLType().String())
+	}
+	return schemaWriter.ApplyTableSchema(
+		ctx,
+		identifier,
+		ddl.TableInfo,
+		ddl.GetDDLType(),
+		s.ownerID,
+		s.changefeedID.String(),
+		s.cfg.TiCDCClusterID,
+		strconv.FormatUint(s.cfg.UpstreamID, 10))
+}
+
 func (s *sink) AddCheckpointTs(ts uint64) {
 	if ts != 0 {
 		s.latestCheckpointTs.Store(ts)
+		s.checkpointPending.Store(true)
 	}
 	select {
 	case s.inputCh <- sinkCommand{checkpointTs: ts}:
@@ -246,6 +357,7 @@ func (s *sink) SetTableSchemaStore(_ *commonEvent.TableSchemaStore) {
 func (s *sink) Close(removeChangefeed bool) {
 	s.isNormal.Store(false)
 	s.closeStageMetrics()
+	s.releaseTargetCommitterLeases()
 	if !removeChangefeed {
 		return
 	}
@@ -294,45 +406,34 @@ func (s *sink) Run(ctx context.Context) error {
 						return errors.Trace(err)
 					}
 				}
+				if s.checkpointPending.Load() {
+					if err := s.stageAllAndDrain(ctx, buffers, s.latestCheckpointTs.Load()); err != nil {
+						if isContextDoneError(ctx, err) {
+							return nil
+						}
+						s.isNormal.Store(false)
+						return errors.Trace(err)
+					}
+				}
 				continue
 			}
 			if cmd.checkpointTs != 0 {
 				s.latestCheckpointTs.Store(cmd.checkpointTs)
 			}
-			if err := s.stageAll(ctx, buffers); err != nil {
+			if err := s.stageAllAndDrain(ctx, buffers, cmd.checkpointTs); err != nil {
 				if isContextDoneError(ctx, err) {
 					return nil
 				}
 				s.isNormal.Store(false)
 				return errors.Trace(err)
-			}
-			if s.isCommitter.Load() {
-				failpoint.Inject("IcebergSinkBlockBeforeDrain", nil)
-				if err := s.drainStaged(ctx, cmd.checkpointTs); err != nil {
-					if isContextDoneError(ctx, err) {
-						return nil
-					}
-					s.isNormal.Store(false)
-					return errors.Trace(err)
-				}
 			}
 		case <-ticker.C:
-			if err := s.stageAll(ctx, buffers); err != nil {
+			if err := s.stageAllAndDrain(ctx, buffers, s.latestCheckpointTs.Load()); err != nil {
 				if isContextDoneError(ctx, err) {
 					return nil
 				}
 				s.isNormal.Store(false)
 				return errors.Trace(err)
-			}
-			if s.isCommitter.Load() {
-				failpoint.Inject("IcebergSinkBlockBeforeDrain", nil)
-				if err := s.drainStaged(ctx, s.latestCheckpointTs.Load()); err != nil {
-					if isContextDoneError(ctx, err) {
-						return nil
-					}
-					s.isNormal.Store(false)
-					return errors.Trace(err)
-				}
 			}
 		}
 	}
@@ -585,7 +686,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			props[snapshotBatchIDKey] = group.batchIDs[0]
 		}
 		appendStart := time.Now()
-		if err := writer.AppendRows(ctx, group.identifier, group.rows, group.tableSchema, props); err != nil {
+		var err error
+		writer, err = s.appendRowsWithCommitConflictRetry(ctx, writer, group, props)
+		if err != nil {
 			s.recordCommitDuration("error", time.Since(appendStart))
 			s.recordAppendFailure(appendFailureReason(err))
 			if errors.Is(err, errIcebergTargetOwnerConflict) || errors.Cause(err) == errIcebergTargetOwnerConflict {
@@ -672,6 +775,40 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			zap.Error(err))
 	}
 	return nil
+}
+
+func (s *sink) appendRowsWithCommitConflictRetry(
+	ctx context.Context,
+	writer appendWriter,
+	group *stagedDrainGroup,
+	props iceberggo.Properties,
+) (appendWriter, error) {
+	var err error
+	for attempt := 0; attempt <= maxCommitConflictRetry; attempt++ {
+		err = writer.AppendRows(ctx, group.identifier, group.rows, group.tableSchema, props)
+		if err == nil {
+			return writer, nil
+		}
+		if !isIcebergCommitFailed(err) || attempt == maxCommitConflictRetry {
+			return writer, err
+		}
+		s.recordAppendFailure("commit_conflict_retry")
+		log.Warn("iceberg committer retrying append after optimistic commit conflict",
+			zap.String("changefeed", s.changefeedID.String()),
+			zap.Strings("identifier", group.identifier),
+			zap.Int("rows", len(group.rows)),
+			zap.Strings("batchIDs", group.batchIDs),
+			zap.Int("attempt", attempt+1),
+			zap.Int("maxAttempts", maxCommitConflictRetry+1),
+			zap.Error(err))
+		s.resetWriter()
+		nextWriter, getErr := s.getWriter(ctx)
+		if getErr != nil {
+			return writer, errors.Trace(getErr)
+		}
+		writer = nextWriter
+	}
+	return writer, err
 }
 
 func (s *sink) committedBatches(
@@ -771,13 +908,15 @@ func (s *sink) claimTargetOwners(ctx context.Context, stagedFiles []stagedFile) 
 func (s *sink) claimTargetOwner(ctx context.Context, identifier []string) error {
 	key := identifierKey(identifier)
 	s.ownerClaimsMu.Lock()
-	_, cached := s.ownerClaims[key]
+	_, alreadyClaimed := s.ownerClaims[key]
 	s.ownerClaimsMu.Unlock()
-	if cached {
-		return nil
+	if err := s.claimTargetCommitterLease(ctx, identifier); err != nil {
+		s.recordTargetOwnerConflict(err)
+		return errors.Trace(err)
 	}
 	if err := s.stage.ClaimTargetOwner(ctx, s.changefeedID.String(), identifier); err != nil {
 		s.recordTargetOwnerConflict(err)
+		s.releaseTargetCommitterLease(key)
 		return errors.Trace(err)
 	}
 	claim := icebergcfg.NewTargetOwnerClaim(
@@ -787,12 +926,144 @@ func (s *sink) claimTargetOwner(ctx context.Context, identifier []string) error 
 		identifier)
 	if err := icebergcfg.ClaimTargetOwner(ctx, s.cfg.Warehouse, claim); err != nil {
 		s.recordTargetOwnerConflict(err)
+		s.releaseTargetCommitterLease(key)
 		return errors.Trace(err)
+	}
+	if !alreadyClaimed {
+		if err := s.reconcileTargetOnTakeover(ctx, identifier); err != nil {
+			s.releaseTargetCommitterLease(key)
+			return errors.Trace(err)
+		}
 	}
 	s.ownerClaimsMu.Lock()
 	s.ownerClaims[key] = struct{}{}
 	s.ownerClaimsMu.Unlock()
 	return nil
+}
+
+func (s *sink) reconcileTargetOnTakeover(ctx context.Context, identifier []string) error {
+	writer, err := s.getWriter(ctx)
+	if err != nil {
+		s.recordAppendFailure("writer_init")
+		s.resetWriter()
+		return errors.Trace(err)
+	}
+	reconciler, ok := writer.(targetTakeoverReconciler)
+	if !ok {
+		return nil
+	}
+	return reconciler.ReconcileTargetOnTakeover(ctx, identifier, s.ownerID, s.changefeedID.String())
+}
+
+func (s *sink) claimTargetCommitterLease(ctx context.Context, identifier []string) error {
+	session, ok := appcontext.GetServiceIfExists[*concurrency.Session](appcontext.EtcdSession)
+	if !ok || session == nil {
+		return nil
+	}
+	select {
+	case <-session.Done():
+		return errors.ErrEtcdSessionDone.GenWithStackByArgs()
+	default:
+	}
+
+	key := identifierKey(identifier)
+	s.ownerClaimsMu.Lock()
+	if election := s.ownerLeases[key]; election != nil {
+		s.ownerClaimsMu.Unlock()
+		return nil
+	}
+	s.ownerClaimsMu.Unlock()
+
+	claim := icebergcfg.NewTargetOwnerClaim(
+		s.cfg.TiCDCClusterID,
+		s.cfg.UpstreamID,
+		s.changefeedID.String(),
+		identifier)
+	payload, err := json.Marshal(&claim)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	electionPrefix := etcd.IcebergCommitterElectionKey(s.cfg.TiCDCClusterID, key)
+	election := concurrency.NewElection(session, electionPrefix)
+	if err := s.validateExistingTargetLeader(ctx, election, string(payload)); err != nil {
+		return errors.Trace(err)
+	}
+
+	timeout := time.Duration(config.GetGlobalServerConfig().CaptureSessionTTL+1) * time.Second
+	if timeout < 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	campaignCtx, cancel := context.WithTimeout(ctx, timeout)
+	err = election.Campaign(campaignCtx, string(payload))
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return errors.Trace(ctx.Err())
+		}
+		if leaderErr := s.validateExistingTargetLeader(context.Background(), election, string(payload)); leaderErr != nil {
+			return errors.Trace(leaderErr)
+		}
+		return errors.Trace(err)
+	}
+
+	s.ownerClaimsMu.Lock()
+	defer s.ownerClaimsMu.Unlock()
+	if existing := s.ownerLeases[key]; existing != nil {
+		_ = election.Resign(context.Background())
+		return nil
+	}
+	s.ownerLeases[key] = election
+	log.Info("iceberg target committer lease acquired",
+		zap.String("changefeed", s.changefeedID.String()),
+		zap.Strings("identifier", identifier),
+		zap.String("electionPrefix", electionPrefix))
+	return nil
+}
+
+func (s *sink) validateExistingTargetLeader(ctx context.Context, election *concurrency.Election, expected string) error {
+	resp, err := election.Leader(ctx)
+	if err != nil {
+		if errors.Is(err, concurrency.ErrElectionNoLeader) {
+			return nil
+		}
+		return errors.Trace(err)
+	}
+	for _, kv := range resp.Kvs {
+		if string(kv.Value) == expected {
+			return nil
+		}
+		var existing icebergcfg.TargetOwnerClaim
+		var expectedClaim icebergcfg.TargetOwnerClaim
+		_ = json.Unmarshal(kv.Value, &existing)
+		_ = json.Unmarshal([]byte(expected), &expectedClaim)
+		return errors.Annotatef(errIcebergTargetOwnerConflict,
+			"etcd committer lease owner %q conflicts with owner %q", existing.OwnerID, expectedClaim.OwnerID)
+	}
+	return nil
+}
+
+func (s *sink) releaseTargetCommitterLease(key string) {
+	s.ownerClaimsMu.Lock()
+	election := s.ownerLeases[key]
+	delete(s.ownerLeases, key)
+	s.ownerClaimsMu.Unlock()
+	if election != nil {
+		_ = election.Resign(context.Background())
+	}
+}
+
+func (s *sink) releaseTargetCommitterLeases() {
+	s.ownerClaimsMu.Lock()
+	leases := make([]*concurrency.Election, 0, len(s.ownerLeases))
+	for key, election := range s.ownerLeases {
+		leases = append(leases, election)
+		delete(s.ownerLeases, key)
+	}
+	s.ownerClaimsMu.Unlock()
+	for _, election := range leases {
+		_ = election.Resign(context.Background())
+	}
 }
 
 func (s *sink) recordStageMetrics(stagedFiles []stagedFile, eligible []stagedFile) {
@@ -840,6 +1111,7 @@ func (s *sink) recordCommitSuccess(batchCount int, rowCount int, checkpointTs ui
 		metrics.IcebergCommitBarrierLagGauge.WithLabelValues(keyspace, changefeed).Set(float64(checkpointTs - maxCommitTs))
 		return
 	}
+	metrics.IcebergNegativeCommitBarrierLagCounter.WithLabelValues(keyspace, changefeed).Inc()
 	metrics.IcebergCommitBarrierLagGauge.WithLabelValues(keyspace, changefeed).Set(0)
 }
 
@@ -872,7 +1144,14 @@ func appendFailureReason(err error) string {
 	if errors.Is(err, errIcebergTargetOwnerConflict) || errors.Cause(err) == errIcebergTargetOwnerConflict {
 		return "owner_conflict"
 	}
+	if isIcebergCommitFailed(err) {
+		return "commit_conflict"
+	}
 	return "append"
+}
+
+func isIcebergCommitFailed(err error) bool {
+	return errors.Is(err, icebergrest.ErrCommitFailed) || errors.Cause(err) == icebergrest.ErrCommitFailed
 }
 
 func (s *sink) recordCleanupFailure(reason string) {
@@ -1075,6 +1354,25 @@ func (s *sink) stageAll(ctx context.Context, buffers map[string]*tableBuffer) er
 		if err := s.stageTable(ctx, buffers, key); err != nil {
 			return errors.Trace(err)
 		}
+	}
+	return nil
+}
+
+func (s *sink) stageAllAndDrain(ctx context.Context, buffers map[string]*tableBuffer, checkpointTs uint64) error {
+	if checkpointTs == 0 && s.checkpointPending.Load() {
+		checkpointTs = s.latestCheckpointTs.Load()
+	}
+	if err := s.stageAll(ctx, buffers); err != nil {
+		return errors.Trace(err)
+	}
+	if s.isCommitter.Load() {
+		failpoint.Inject("IcebergSinkBlockBeforeDrain", nil)
+		if err := s.drainStaged(ctx, checkpointTs); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	if checkpointTs != 0 && checkpointTs >= s.latestCheckpointTs.Load() {
+		s.checkpointPending.Store(false)
 	}
 	return nil
 }

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	iceberggo "github.com/apache/iceberg-go"
+	icebergrest "github.com/apache/iceberg-go/catalog/rest"
 	"github.com/pingcap/ticdc/pkg/common"
 	commonEvent "github.com/pingcap/ticdc/pkg/common/event"
 	cerror "github.com/pingcap/ticdc/pkg/errors"
@@ -163,6 +164,101 @@ func (r *recordingAppendWriter) getCalls() []appendCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]appendCall(nil), r.calls...)
+}
+
+type recordingReconcileWriter struct {
+	recordingAppendWriter
+	reconcileCalls [][]string
+}
+
+func (r *recordingReconcileWriter) ReconcileTargetOnTakeover(
+	_ context.Context,
+	identifier []string,
+	_ string,
+	_ string,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reconcileCalls = append(r.reconcileCalls, append([]string(nil), identifier...))
+	return nil
+}
+
+func (r *recordingReconcileWriter) getReconcileCalls() [][]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([][]string(nil), r.reconcileCalls...)
+}
+
+type flakyCommitWriter struct {
+	recordingAppendWriter
+	failures int
+}
+
+type schemaUpdateCall struct {
+	identifier   []string
+	tableInfo    *common.TableInfo
+	ddlType      model.ActionType
+	ownerID      string
+	changefeed   string
+	cdcClusterID string
+	upstreamID   string
+}
+
+type recordingSchemaAppendWriter struct {
+	recordingAppendWriter
+	schemaMu    sync.Mutex
+	schemaCalls []schemaUpdateCall
+	schemaErr   error
+}
+
+func (w *recordingSchemaAppendWriter) ApplyTableSchema(
+	_ context.Context,
+	identifier []string,
+	tableInfo *common.TableInfo,
+	ddlType model.ActionType,
+	ownerID string,
+	changefeed string,
+	cdcClusterID string,
+	upstreamID string,
+) error {
+	w.schemaMu.Lock()
+	defer w.schemaMu.Unlock()
+	if w.schemaErr != nil {
+		return w.schemaErr
+	}
+	w.schemaCalls = append(w.schemaCalls, schemaUpdateCall{
+		identifier:   append([]string(nil), identifier...),
+		tableInfo:    tableInfo,
+		ddlType:      ddlType,
+		ownerID:      ownerID,
+		changefeed:   changefeed,
+		cdcClusterID: cdcClusterID,
+		upstreamID:   upstreamID,
+	})
+	return nil
+}
+
+func (w *recordingSchemaAppendWriter) getSchemaCalls() []schemaUpdateCall {
+	w.schemaMu.Lock()
+	defer w.schemaMu.Unlock()
+	return append([]schemaUpdateCall(nil), w.schemaCalls...)
+}
+
+func (w *flakyCommitWriter) AppendRows(
+	ctx context.Context,
+	identifier []string,
+	rows []map[string]any,
+	tableSchema *stagedTableSchema,
+	props iceberggo.Properties,
+) error {
+	w.mu.Lock()
+	if w.failures > 0 {
+		w.failures--
+		w.mu.Unlock()
+		return icebergrest.ErrCommitFailed
+	}
+	w.mu.Unlock()
+	return w.recordingAppendWriter.AppendRows(ctx, identifier, rows, tableSchema, props)
 }
 
 func TestSinkFlushesRowsOnCheckpoint(t *testing.T) {
@@ -1330,6 +1426,37 @@ func TestAddCheckpointTsUpdatesLatestWhenCommandChannelFull(t *testing.T) {
 	require.Equal(t, uint64(99), s.latestCheckpointTs.Load())
 }
 
+func TestAddCheckpointTsDrainsPendingCheckpointWhenCommandChannelFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-test"), cfg, writer)
+	s.SetTableSchemaStore(nil)
+	s.inputCh = make(chan sinkCommand, 1)
+	s.inputCh <- sinkCommand{}
+
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, s.stage.Write(ctx, s.changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+
+	s.AddCheckpointTs(10)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
 func TestSinkRecordsIcebergStagedBacklogMetrics(t *testing.T) {
 	ctx := context.Background()
 	cfg := newSinkTestConfig(t, 1024)
@@ -1406,6 +1533,40 @@ func TestSinkRecordsIcebergCommitMetrics(t *testing.T) {
 
 	cancel()
 	require.NoError(t, <-errCh)
+}
+
+func TestCommitterRecordsNegativeLagMetric(t *testing.T) {
+	ctx := context.Background()
+	cfg := newSinkTestConfig(t, 1024)
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-negative-lag")
+	s := newSink(ctx, changefeedID, cfg, &recordingAppendWriter{})
+	defer s.closeMetrics()
+
+	s.recordCommitSuccess(0, 0, 5, 10)
+
+	require.Equal(t, float64(1), testutil.ToFloat64(
+		metrics.IcebergNegativeCommitBarrierLagCounter.WithLabelValues("default", "iceberg-negative-lag")))
+	require.Equal(t, float64(0), testutil.ToFloat64(
+		metrics.IcebergCommitBarrierLagGauge.WithLabelValues("default", "iceberg-negative-lag")))
+}
+
+func TestCommitterRetriesIcebergCommitFailedInSameDrain(t *testing.T) {
+	ctx := context.Background()
+	cfg := newSinkTestConfig(t, 1024)
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-cas-retry")
+	writer := &flakyCommitWriter{failures: 1}
+	s := newSink(ctx, changefeedID, cfg, writer)
+	s.SetTableSchemaStore(nil)
+
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, s.stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+
+	require.NoError(t, s.drainStaged(ctx, 10))
+
+	require.Len(t, writer.getCalls(), 1)
+	require.Equal(t, 0, stageFileCount(t, cfg.StagingDir))
 }
 
 func TestClosePreservesOwnerConflictMetricUntilRemove(t *testing.T) {
@@ -1527,6 +1688,43 @@ func TestCommitterRejectsWarehouseTargetOwnerClaimAcrossClusters(t *testing.T) {
 	require.Empty(t, writer.getCalls())
 	require.Equal(t, float64(1), testutil.ToFloat64(
 		metrics.IcebergTargetOwnerConflictCounter.WithLabelValues("default", "iceberg-right-warehouse")))
+}
+
+func TestClaimTargetOwnerRevalidatesCachedWarehouseMarker(t *testing.T) {
+	ctx := context.Background()
+	cfg := newSinkTestConfig(t, 1024)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-owner-refresh")
+	s := newSink(ctx, changefeedID, cfg, &recordingAppendWriter{})
+	identifier := []string{"test", "orders_cdc"}
+
+	require.NoError(t, s.claimTargetOwner(ctx, identifier))
+	require.NoError(t, icebergcfg.CleanupTargetOwnerClaims(ctx, cfg.Warehouse, s.ownerID))
+	require.NoError(t, s.claimTargetOwner(ctx, identifier))
+
+	err := icebergcfg.ClaimTargetOwner(ctx, cfg.Warehouse,
+		icebergcfg.NewTargetOwnerClaim("cdc-b", 2002, "default/other", identifier))
+	require.Error(t, err)
+	require.True(t, cerror.Is(err, icebergcfg.ErrTargetOwnerConflict))
+}
+
+func TestClaimTargetOwnerRunsTakeoverReconciliationOnce(t *testing.T) {
+	ctx := context.Background()
+	cfg := newSinkTestConfig(t, 1024)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-reconcile")
+	writer := &recordingReconcileWriter{}
+	s := newSink(ctx, changefeedID, cfg, writer)
+	identifier := []string{"test", "orders_cdc"}
+
+	require.NoError(t, s.claimTargetOwner(ctx, identifier))
+	require.NoError(t, s.claimTargetOwner(ctx, identifier))
+
+	calls := writer.getReconcileCalls()
+	require.Len(t, calls, 1)
+	require.Equal(t, identifier, calls[0])
 }
 
 func TestCloseRemoveChangefeedDeletesOnlyOwnStaging(t *testing.T) {
@@ -1753,6 +1951,61 @@ func TestWriteBlockEventAllowsBootstrapCreateDDL(t *testing.T) {
 
 	require.NoError(t, s.WriteBlockEvent(ddl))
 	require.True(t, flushed)
+}
+
+func TestWriteBlockEventAppliesSupportedColumnDDL(t *testing.T) {
+	ctx := context.Background()
+	writer := &recordingSchemaAppendWriter{}
+	cfg := newSinkTestConfig(t, 1)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-ddl")
+	s := newSink(ctx, changefeedID, cfg, writer)
+	tableInfo := newRichPayloadTestTableInfo()
+
+	ddl := &commonEvent.DDLEvent{
+		Type:       byte(model.ActionAddColumn),
+		Query:      "alter table app.rich_types add column amount decimal(20, 4)",
+		SchemaName: "app",
+		TableName:  "rich_types",
+		TableInfo:  tableInfo,
+		FinishedTs: 42,
+	}
+	flushed := false
+	ddl.AddPostFlushFunc(func() { flushed = true })
+
+	require.NoError(t, s.WriteBlockEvent(ddl))
+	require.True(t, flushed)
+	calls := writer.getSchemaCalls()
+	require.Len(t, calls, 1)
+	require.Equal(t, []string{"app", "rich_types_cdc"}, calls[0].identifier)
+	require.Same(t, tableInfo, calls[0].tableInfo)
+	require.Equal(t, model.ActionAddColumn, calls[0].ddlType)
+	require.Equal(t, s.ownerID, calls[0].ownerID)
+	require.Equal(t, changefeedID.String(), calls[0].changefeed)
+	require.Equal(t, "cdc-a", calls[0].cdcClusterID)
+	require.Equal(t, "1001", calls[0].upstreamID)
+}
+
+func TestWriteBlockEventTreatsIndexDDLAsMetadataOnly(t *testing.T) {
+	ctx := context.Background()
+	writer := &recordingSchemaAppendWriter{}
+	cfg := newSinkTestConfig(t, 1)
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-ddl-index"), cfg, writer)
+
+	ddl := &commonEvent.DDLEvent{
+		Type:       byte(model.ActionAddIndex),
+		Query:      "alter table app.rich_types add index idx_amount(amount)",
+		SchemaName: "app",
+		TableName:  "rich_types",
+		FinishedTs: 42,
+	}
+	flushed := false
+	ddl.AddPostFlushFunc(func() { flushed = true })
+
+	require.NoError(t, s.WriteBlockEvent(ddl))
+	require.True(t, flushed)
+	require.Empty(t, writer.getSchemaCalls())
 }
 
 func newSinkTestConfig(t *testing.T, batchRows int) *icebergcfg.Config {

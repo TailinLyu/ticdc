@@ -162,7 +162,11 @@ type strongExtStorageWithTimeout struct {
 	*extStorageWithTimeout
 }
 
-func (*strongExtStorageWithTimeout) MarkStrongConsistency() {}
+func (s *strongExtStorageWithTimeout) MarkStrongConsistency() {
+	if strong, ok := s.ExternalStorage.(storage.StrongConsistency); ok {
+		strong.MarkStrongConsistency()
+	}
+}
 
 func wrapExternalStorageWithTimeout(s storage.ExternalStorage, timeout time.Duration) storage.ExternalStorage {
 	wrapped := &extStorageWithTimeout{

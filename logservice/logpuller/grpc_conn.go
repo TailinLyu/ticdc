@@ -84,6 +84,8 @@ func createGRPCConn(ctx context.Context, credential *security.Credential, target
 			Timeout:             3 * time.Second,
 			PermitWithoutStream: true,
 		}),
+		// grpc-go removed WithRecvBufferPool/NewSharedBufferPool in the
+		// version required by iceberg-go; keep the API migration contained here.
 		experimental.WithBufferPool(mem.DefaultBufferPool()),
 	}
 
