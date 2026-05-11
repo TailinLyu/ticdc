@@ -37,14 +37,48 @@ import (
 
 const defaultTimeout = 5 * time.Minute
 
+type externalStorageConfig struct {
+	backendOptions *storage.BackendOptions
+	httpClient     *http.Client
+}
+
+// ExternalStorageOption customizes storage.ExternalStorage construction.
+type ExternalStorageOption func(*externalStorageConfig)
+
+// WithExternalStorageBackendOptions configures storage backend options not
+// expressed by the URI, such as S3 region/endpoint/path-style settings.
+func WithExternalStorageBackendOptions(opts *storage.BackendOptions) ExternalStorageOption {
+	return func(cfg *externalStorageConfig) {
+		cfg.backendOptions = opts
+	}
+}
+
+// WithExternalStorageHTTPClient configures the HTTP client used by cloud
+// storage backends that support it.
+func WithExternalStorageHTTPClient(client *http.Client) ExternalStorageOption {
+	return func(cfg *externalStorageConfig) {
+		cfg.httpClient = client
+	}
+}
+
 // GetExternalStorageWithDefaultTimeout creates a new storage.ExternalStorage from a uri
 // without retry. It is the caller's responsibility to set timeout to the context.
-func GetExternalStorageWithDefaultTimeout(ctx context.Context, uri string) (storage.ExternalStorage, error) {
+func GetExternalStorageWithDefaultTimeout(
+	ctx context.Context,
+	uri string,
+	options ...ExternalStorageOption,
+) (storage.ExternalStorage, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
+	cfg := &externalStorageConfig{}
+	for _, opt := range options {
+		if opt != nil {
+			opt(cfg)
+		}
+	}
 	// total retry time is [1<<7, 1<<8] = [128, 256] + 30*6 = [308, 436] seconds
 	r := NewS3Retryer(7, 1*time.Second, 2*time.Second)
-	s, err := getExternalStorage(ctx, uri, nil, r)
+	s, err := getExternalStorage(ctx, uri, cfg.backendOptions, r, cfg.httpClient)
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +91,7 @@ func getExternalStorage(
 	ctx context.Context, uri string,
 	opts *storage.BackendOptions,
 	retryer request.Retryer,
+	httpClient *http.Client,
 ) (storage.ExternalStorage, error) {
 	backEnd, err := storage.ParseBackend(uri, opts)
 	if err != nil {
@@ -66,6 +101,7 @@ func getExternalStorage(
 	ret, err := storage.New(ctx, backEnd, &storage.ExternalStorageOptions{
 		SendCredentials: false,
 		S3Retryer:       retryer,
+		HTTPClient:      httpClient,
 	})
 	if err != nil {
 		retErr := errors.ErrFailToCreateExternalStorage.Wrap(errors.Trace(err))
@@ -85,7 +121,7 @@ func getExternalStorage(
 func getExternalStorageFromURI(
 	ctx context.Context, uri string,
 ) (storage.ExternalStorage, error) {
-	return getExternalStorage(ctx, uri, nil, DefaultS3Retryer())
+	return getExternalStorage(ctx, uri, nil, DefaultS3Retryer(), nil)
 }
 
 // GetTestExtStorage creates a test storage.ExternalStorage from a uri.

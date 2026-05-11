@@ -74,6 +74,22 @@ func TargetOwnerID(cdcClusterID string, upstreamID uint64, changefeed string) st
 }
 
 func ClaimTargetOwner(ctx context.Context, warehouse string, claim TargetOwnerClaim) error {
+	return claimTargetOwner(ctx, warehouse, claim)
+}
+
+func ClaimTargetOwnerWithConfig(ctx context.Context, cfg *Config, claim TargetOwnerClaim) error {
+	if cfg == nil {
+		return fmt.Errorf("nil iceberg sink config")
+	}
+	return claimTargetOwner(ctx, cfg.Warehouse, claim, cfg.externalStorageOptions()...)
+}
+
+func claimTargetOwner(
+	ctx context.Context,
+	warehouse string,
+	claim TargetOwnerClaim,
+	storageOptions ...util.ExternalStorageOption,
+) error {
 	if claim.OwnerID == "" {
 		return fmt.Errorf("iceberg target owner id is empty")
 	}
@@ -81,7 +97,7 @@ func ClaimTargetOwner(ctx context.Context, warehouse string, claim TargetOwnerCl
 		return fmt.Errorf("iceberg target identifier is empty")
 	}
 
-	store, err := util.GetExternalStorageWithDefaultTimeout(ctx, warehouse)
+	store, err := util.GetExternalStorageWithDefaultTimeout(ctx, warehouse, storageOptions...)
 	if err != nil {
 		return err
 	}
@@ -151,10 +167,26 @@ func readTargetOwnerClaimIfExists(
 }
 
 func CleanupTargetOwnerClaims(ctx context.Context, warehouse string, ownerID string) error {
+	return cleanupWarehouseTargetOwnerClaims(ctx, warehouse, ownerID)
+}
+
+func CleanupTargetOwnerClaimsWithConfig(ctx context.Context, cfg *Config, ownerID string) error {
+	if cfg == nil {
+		return fmt.Errorf("nil iceberg sink config")
+	}
+	return cleanupWarehouseTargetOwnerClaims(ctx, cfg.Warehouse, ownerID, cfg.externalStorageOptions()...)
+}
+
+func cleanupWarehouseTargetOwnerClaims(
+	ctx context.Context,
+	warehouse string,
+	ownerID string,
+	storageOptions ...util.ExternalStorageOption,
+) error {
 	if ownerID == "" {
 		return nil
 	}
-	store, err := util.GetExternalStorageWithDefaultTimeout(ctx, warehouse)
+	store, err := util.GetExternalStorageWithDefaultTimeout(ctx, warehouse, storageOptions...)
 	if err != nil {
 		return err
 	}

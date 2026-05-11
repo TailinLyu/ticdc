@@ -27,9 +27,6 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
 	icebergtable "github.com/apache/iceberg-go/table"
-	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	smithymiddleware "github.com/aws/smithy-go/middleware"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/errors"
@@ -86,21 +83,13 @@ func restCatalogOptions(
 			suppressHeaders: cfg.SuppressHeaders,
 		}))
 	}
-	if cfg.AWSRegion != "" || cfg.AWSUserAgent != "" {
-		loadOpts := make([]func(*awsconfig.LoadOptions) error, 0, 2)
-		if cfg.AWSRegion != "" {
-			loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.AWSRegion))
-		}
-		if cfg.AWSUserAgent != "" {
-			loadOpts = append(loadOpts, awsconfig.WithAPIOptions([]func(*smithymiddleware.Stack) error{
-				awsmiddleware.AddUserAgentKey(cfg.AWSUserAgent),
-			}))
-		}
-		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
-		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
-		opts = append(opts, rest.WithAwsConfig(awsCfg))
+	if props := cfg.IcebergS3Properties(); len(props) > 0 {
+		opts = append(opts, rest.WithAdditionalProps(iceberggo.Properties(props)))
+	}
+	if awsCfg, err := cfg.BuildAWSConfig(ctx); err != nil {
+		return nil, nil, errors.Trace(err)
+	} else if awsCfg != nil {
+		opts = append(opts, rest.WithAwsConfig(*awsCfg))
 	}
 	return ctx, opts, nil
 }

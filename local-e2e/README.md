@@ -117,6 +117,17 @@ These properties are merged only when TiCDC creates the Iceberg table. TiCDC's
 managed properties, including `format-version`, `write.format.default`, and
 owner/audit keys, win if an operator-supplied key conflicts.
 
+S3-compatible Iceberg warehouses can share one structured AWS option block
+across the iceberg-go catalog/data path and TiDB BR storage owner-marker path:
+
+```text
+iceberg://iceberg-rest:8181/?warehouse=s3://bucket/warehouse&staging-dir=file:///mnt/ticdc-stage&aws=%7B%22region%22%3A%22us-east-1%22%2C%22endpoint%22%3A%22https%3A%2F%2Fs3.example.com%22%2C%22path-style-access%22%3Atrue%2C%22user-agent-tags%22%3A%5B%22ticdc-iceberg%22%5D%7D
+```
+
+Supported fields are `region`, `endpoint`, `path-style-access`, and
+`user-agent-tags`. The legacy `aws-region` and `aws-user-agent` URI parameters
+remain accepted as aliases.
+
 ## Querying Iceberg
 
 Go helper:

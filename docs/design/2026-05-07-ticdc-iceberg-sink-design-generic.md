@@ -429,12 +429,18 @@ type Config struct {
     IcebergDatabasePrefix string `toml:"iceberg-database-prefix"`  // empty by default
     IcebergTableSuffix    string `toml:"iceberg-table-suffix"`     // "_cdc" by default
 
-    // Manifest behavior
-    ManifestMergeThreshold int `toml:"manifest-merge-threshold"`   // default 8 (Iceberg's own default)
+    // Catalog/storage deployment knobs
+    CatalogHostHeader string            `toml:"catalog-host-header"`
+    SuppressHeaders   []string          `toml:"suppress-headers"`
+    AWS               AWSOptions        `toml:"aws"`
+    TableProperties   map[string]string `toml:"table-properties"`
 }
 ```
 
-No catalog-host-header, no UA, no vended-credentials toggles. Pure REST + filesystem.
+The sink URI accepts the same deployment knobs. `aws` is a JSON object in URI
+form and currently supports `region`, `endpoint`, `path-style-access`, and
+`user-agent-tags`; legacy `aws-region` and `aws-user-agent` query parameters
+remain aliases.
 
 ## 9. Encoder: TiDB row → Arrow record → Parquet
 

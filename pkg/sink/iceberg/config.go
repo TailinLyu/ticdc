@@ -49,6 +49,10 @@ type Config struct {
 	SuppressHeaders   []string
 
 	// Optional AWS SDK knobs for REST catalog SigV4/storage clients.
+	AWS AWSOptions
+
+	// AWSRegion and AWSUserAgent are legacy aliases for AWS.Region and the
+	// first AWS.UserAgentTags entry. New code should use AWS instead.
 	AWSRegion    string
 	AWSUserAgent string
 
@@ -85,11 +89,21 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 			query.Get("catalog-host-header"), query.Get("iceberg-catalog-host-header"))),
 		SuppressHeaders: splitCommaList(firstNonEmpty(
 			query.Get("suppress-headers"), query.Get("iceberg-suppress-headers"))),
-		AWSRegion: strings.TrimSpace(firstNonEmpty(
-			query.Get("aws-region"), query.Get("iceberg-aws-region"))),
-		AWSUserAgent: strings.TrimSpace(firstNonEmpty(
-			query.Get("aws-user-agent"), query.Get("iceberg-aws-user-agent"))),
 	}
+	awsOptions, err := parseAWSOptions(firstNonEmpty(
+		query.Get("aws"), query.Get("aws-options"),
+		query.Get("iceberg-aws"), query.Get("iceberg-aws-options")))
+	if err != nil {
+		return nil, err
+	}
+	legacyAWSRegion := strings.TrimSpace(firstNonEmpty(
+		query.Get("aws-region"), query.Get("iceberg-aws-region")))
+	legacyAWSUserAgent := strings.TrimSpace(firstNonEmpty(
+		query.Get("aws-user-agent"), query.Get("iceberg-aws-user-agent")))
+	awsOptions.mergeLegacyAliases(legacyAWSRegion, legacyAWSUserAgent)
+	cfg.AWS = awsOptions
+	cfg.AWSRegion = cfg.AWS.Region
+	cfg.AWSUserAgent = cfg.AWS.firstUserAgentTag()
 	tableProperties, err := parseTableProperties(firstNonEmpty(
 		query.Get("table-properties"), query.Get("iceberg-table-properties")))
 	if err != nil {

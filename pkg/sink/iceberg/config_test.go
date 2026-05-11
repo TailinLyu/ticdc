@@ -39,6 +39,8 @@ func TestParseConfigFromSinkURI(t *testing.T) {
 	require.Equal(t, []string{"X-Iceberg-Access-Delegation", "X-Test"}, cfg.SuppressHeaders)
 	require.Equal(t, "us-west-2", cfg.AWSRegion)
 	require.Equal(t, "ticdc-iceberg-test", cfg.AWSUserAgent)
+	require.Equal(t, "us-west-2", cfg.AWS.Region)
+	require.Equal(t, []string{"ticdc-iceberg-test"}, cfg.AWS.UserAgentTags)
 	require.Equal(t, map[string]string{
 		"create_iceberg_table_location_bucket": "my-bucket",
 		"write.parquet.compression-codec":      "zstd",
@@ -57,6 +59,47 @@ func TestParseConfigAcceptsJSONTableProperties(t *testing.T) {
 		"create_iceberg_table_location_bucket": "my-bucket",
 		"write.metadata.compression-codec":     "gzip",
 	}, cfg.TableProperties)
+}
+
+func TestParseConfigAcceptsStructuredAWSOptions(t *testing.T) {
+	rawAWS := `{"region":"us-east-1","endpoint":"https://s3.example.com","path-style-access":false,"user-agent-tags":["iceberg-ready","my-app/1.2"]}`
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&aws=" + url.QueryEscape(rawAWS))
+	require.NoError(t, err)
+
+	cfg, err := ParseConfig(uri)
+	require.NoError(t, err)
+
+	require.Equal(t, "us-east-1", cfg.AWS.Region)
+	require.Equal(t, "https://s3.example.com", cfg.AWS.Endpoint)
+	require.NotNil(t, cfg.AWS.PathStyleAccess)
+	require.False(t, *cfg.AWS.PathStyleAccess)
+	require.Equal(t, []string{"iceberg-ready", "my-app/1.2"}, cfg.AWS.UserAgentTags)
+	require.Equal(t, "us-east-1", cfg.AWSRegion)
+	require.Equal(t, "iceberg-ready", cfg.AWSUserAgent)
+}
+
+func TestParseConfigKeepsLegacyAWSAliases(t *testing.T) {
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&aws-region=us-west-2&aws-user-agent=ticdc-iceberg-test")
+	require.NoError(t, err)
+
+	cfg, err := ParseConfig(uri)
+	require.NoError(t, err)
+
+	require.Equal(t, "us-west-2", cfg.AWS.Region)
+	require.Equal(t, []string{"ticdc-iceberg-test"}, cfg.AWS.UserAgentTags)
+	require.Equal(t, "us-west-2", cfg.AWSRegion)
+	require.Equal(t, "ticdc-iceberg-test", cfg.AWSUserAgent)
+}
+
+func TestParseConfigRejectsInvalidAWSOptions(t *testing.T) {
+	for _, raw := range []string{`{"region":`, `{"user-agent-tags":[""]}`} {
+		uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&aws=" + url.QueryEscape(raw))
+		require.NoError(t, err)
+
+		_, err = ParseConfig(uri)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "aws")
+	}
 }
 
 func TestParseConfigRejectsInvalidTableProperties(t *testing.T) {

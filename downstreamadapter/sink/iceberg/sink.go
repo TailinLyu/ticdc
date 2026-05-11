@@ -368,7 +368,7 @@ func (s *sink) Close(removeChangefeed bool) {
 			zap.String("changefeed", s.changefeedID.String()),
 			zap.Error(err))
 	}
-	if err := icebergcfg.CleanupTargetOwnerClaims(context.Background(), s.cfg.Warehouse, s.ownerID); err != nil {
+	if err := icebergcfg.CleanupTargetOwnerClaimsWithConfig(context.Background(), s.cfg, s.ownerID); err != nil {
 		s.recordCleanupFailure("owner_marker")
 		log.Warn("close iceberg sink, remove warehouse target owner claim meet error",
 			zap.String("changefeed", s.changefeedID.String()),
@@ -924,7 +924,7 @@ func (s *sink) claimTargetOwner(ctx context.Context, identifier []string) error 
 		s.cfg.UpstreamID,
 		s.changefeedID.String(),
 		identifier)
-	if err := icebergcfg.ClaimTargetOwner(ctx, s.cfg.Warehouse, claim); err != nil {
+	if err := icebergcfg.ClaimTargetOwnerWithConfig(ctx, s.cfg, claim); err != nil {
 		s.recordTargetOwnerConflict(err)
 		s.releaseTargetCommitterLease(key)
 		return errors.Trace(err)
