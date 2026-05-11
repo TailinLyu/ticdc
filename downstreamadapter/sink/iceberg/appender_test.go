@@ -22,9 +22,11 @@ import (
 	"testing"
 
 	iceberggo "github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
 	icebergutils "github.com/apache/iceberg-go/utils"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
 	"github.com/stretchr/testify/require"
 )
@@ -142,6 +144,86 @@ func TestRestCatalogOptionsPlumbsAWSConfigIntoIcebergIOContext(t *testing.T) {
 	require.NotNil(t, awsCfg)
 	require.Equal(t, "us-west-2", awsCfg.Region)
 	require.NotEmpty(t, awsCfg.APIOptions)
+}
+
+func TestIcebergAppenderPlumbsAWSConfigIntoRuntimeContext(t *testing.T) {
+	appender := &icebergAppender{
+		awsCfg: &aws.Config{Region: "us-west-2"},
+	}
+
+	ctx := appender.ctxWithAWS(context.Background())
+	awsCfg := icebergutils.GetAwsConfig(ctx)
+	require.NotNil(t, awsCfg)
+	require.Equal(t, "us-west-2", awsCfg.Region)
+}
+
+type loadTableProbeCatalog struct {
+	catalog.Catalog
+
+	loadCtx context.Context
+	loadErr error
+}
+
+func (c *loadTableProbeCatalog) LoadTable(
+	ctx context.Context,
+	_ icebergtable.Identifier,
+) (*icebergtable.Table, error) {
+	c.loadCtx = ctx
+	return nil, c.loadErr
+}
+
+func TestAppendRowsPlumbsAWSConfigIntoIcebergLoadContext(t *testing.T) {
+	loadErr := stderrors.New("stop after load")
+	cat := &loadTableProbeCatalog{loadErr: loadErr}
+	appender := &icebergAppender{
+		catalog: cat,
+		awsCfg:  &aws.Config{Region: "us-west-2"},
+	}
+
+	err := appender.AppendRows(context.Background(),
+		[]string{"db", "tbl"},
+		[]map[string]any{{"id": int64(1)}},
+		nil,
+		iceberggo.Properties{})
+
+	require.ErrorContains(t, err, loadErr.Error())
+	awsCfg := icebergutils.GetAwsConfig(cat.loadCtx)
+	require.NotNil(t, awsCfg)
+	require.Equal(t, "us-west-2", awsCfg.Region)
+}
+
+func TestNewIcebergAppenderKeepsAWSConfigForRuntimeContexts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/config" {
+			http.NotFound(w, r)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"defaults":  map[string]any{},
+			"overrides": map[string]any{},
+		}))
+	}))
+	defer server.Close()
+
+	appender, err := newIcebergAppender(context.Background(), &icebergcfg.Config{
+		CatalogURI:   server.URL,
+		Warehouse:    "file:///tmp/warehouse",
+		AWSRegion:    "us-west-2",
+		AWSUserAgent: "ticdc-iceberg-test",
+	})
+	require.NoError(t, err)
+
+	awsCfg := icebergutils.GetAwsConfig(appender.ctxWithAWS(context.Background()))
+	require.NotNil(t, awsCfg)
+	require.Equal(t, "us-west-2", awsCfg.Region)
+	require.NotEmpty(t, awsCfg.APIOptions)
+}
+
+func TestIcebergAppenderLeavesRuntimeContextUnchangedWithoutAWSConfig(t *testing.T) {
+	appender := &icebergAppender{}
+	ctx := context.Background()
+
+	require.Equal(t, ctx, appender.ctxWithAWS(ctx))
 }
 
 func TestNewIcebergAppenderAuthModeNoneDropsAuthorization(t *testing.T) {

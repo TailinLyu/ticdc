@@ -28,6 +28,7 @@ import (
 	"github.com/apache/iceberg-go/catalog/rest"
 	icebergtable "github.com/apache/iceberg-go/table"
 	icebergutils "github.com/apache/iceberg-go/utils"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/errors"
@@ -39,6 +40,7 @@ import (
 type icebergAppender struct {
 	catalog         catalog.Catalog
 	tableProperties map[string]string
+	awsCfg          *aws.Config
 
 	mu     sync.Mutex
 	tables map[string]*icebergtable.Table
@@ -50,7 +52,11 @@ type namespaceEnsurer interface {
 }
 
 func newIcebergAppender(ctx context.Context, cfg *icebergcfg.Config) (*icebergAppender, error) {
-	ctx, opts, err := restCatalogOptions(ctx, cfg)
+	awsCfg, err := cfg.BuildAWSConfig(ctx)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	ctx, opts, err := restCatalogOptionsWithAWS(ctx, cfg, awsCfg)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -61,6 +67,7 @@ func newIcebergAppender(ctx context.Context, cfg *icebergcfg.Config) (*icebergAp
 	return &icebergAppender{
 		catalog:         cat,
 		tableProperties: cloneStringMap(cfg.TableProperties),
+		awsCfg:          awsCfg,
 		tables:          make(map[string]*icebergtable.Table),
 	}, nil
 }
@@ -68,6 +75,18 @@ func newIcebergAppender(ctx context.Context, cfg *icebergcfg.Config) (*icebergAp
 func restCatalogOptions(
 	ctx context.Context,
 	cfg *icebergcfg.Config,
+) (context.Context, []rest.Option, error) {
+	awsCfg, err := cfg.BuildAWSConfig(ctx)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+	return restCatalogOptionsWithAWS(ctx, cfg, awsCfg)
+}
+
+func restCatalogOptionsWithAWS(
+	ctx context.Context,
+	cfg *icebergcfg.Config,
+	awsCfg *aws.Config,
 ) (context.Context, []rest.Option, error) {
 	opts := []rest.Option{rest.WithWarehouseLocation(cfg.Warehouse)}
 	suppressHeaders := cfg.EffectiveSuppressHeaders()
@@ -91,13 +110,18 @@ func restCatalogOptions(
 	if props := cfg.IcebergS3Properties(); len(props) > 0 {
 		opts = append(opts, rest.WithAdditionalProps(iceberggo.Properties(props)))
 	}
-	if awsCfg, err := cfg.BuildAWSConfig(ctx); err != nil {
-		return nil, nil, errors.Trace(err)
-	} else if awsCfg != nil {
+	if awsCfg != nil {
 		opts = append(opts, rest.WithAwsConfig(*awsCfg))
 		ctx = icebergutils.WithAwsConfig(ctx, awsCfg)
 	}
 	return ctx, opts, nil
+}
+
+func (a *icebergAppender) ctxWithAWS(ctx context.Context) context.Context {
+	if a.awsCfg == nil {
+		return ctx
+	}
+	return icebergutils.WithAwsConfig(ctx, a.awsCfg)
 }
 
 type noAuthManager struct{}
@@ -137,6 +161,7 @@ func (a *icebergAppender) AppendRows(
 	tableSchema *stagedTableSchema,
 	snapshotProps iceberggo.Properties,
 ) error {
+	ctx = a.ctxWithAWS(ctx)
 	if len(rows) == 0 {
 		return nil
 	}
@@ -182,6 +207,7 @@ func (a *icebergAppender) CommittedBatches(
 	identifier []string,
 	batchIDs []string,
 ) (map[string]struct{}, error) {
+	ctx = a.ctxWithAWS(ctx)
 	tbl, err := a.catalog.LoadTable(ctx, icebergtable.Identifier(identifier))
 	if err != nil {
 		if stderrors.Is(err, catalog.ErrNoSuchTable) {
@@ -202,6 +228,7 @@ func (a *icebergAppender) ReconcileTargetOnTakeover(
 	ownerID string,
 	changefeed string,
 ) error {
+	ctx = a.ctxWithAWS(ctx)
 	tbl, err := a.catalog.LoadTable(ctx, icebergtable.Identifier(identifier))
 	if err != nil {
 		if stderrors.Is(err, catalog.ErrNoSuchTable) {
@@ -239,6 +266,7 @@ func (a *icebergAppender) ApplyTableSchema(
 	cdcClusterID string,
 	upstreamID string,
 ) error {
+	ctx = a.ctxWithAWS(ctx)
 	if tableInfo == nil {
 		return errors.New("iceberg schema update has no table info")
 	}
@@ -442,6 +470,7 @@ func (a *icebergAppender) loadOrCreateTable(
 	cdcClusterID string,
 	upstreamID string,
 ) (*icebergtable.Table, error) {
+	ctx = a.ctxWithAWS(ctx)
 	key := identifierKey(identifier)
 
 	a.mu.Lock()
@@ -483,6 +512,7 @@ func (a *icebergAppender) createTable(
 	cdcClusterID string,
 	upstreamID string,
 ) (*icebergtable.Table, error) {
+	ctx = a.ctxWithAWS(ctx)
 	ident := icebergtable.Identifier(identifier)
 	namespace := catalog.NamespaceFromIdent(ident)
 	if err := ensureNamespace(ctx, a.catalog, namespace); err != nil {
