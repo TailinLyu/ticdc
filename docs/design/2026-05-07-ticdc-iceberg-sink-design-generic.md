@@ -431,6 +431,7 @@ type Config struct {
 
     // Catalog/storage deployment knobs
     CatalogHostHeader string            `toml:"catalog-host-header"`
+    CatalogAuthMode   string            `toml:"auth-mode"` // "none" suppresses empty bearer auth
     SuppressHeaders   []string          `toml:"suppress-headers"`
     AWS               AWSOptions        `toml:"aws"`
     TableProperties   map[string]string `toml:"table-properties"`
@@ -440,7 +441,9 @@ type Config struct {
 The sink URI accepts the same deployment knobs. `aws` is a JSON object in URI
 form and currently supports `region`, `endpoint`, `path-style-access`, and
 `user-agent-tags`; legacy `aws-region` and `aws-user-agent` query parameters
-remain aliases.
+remain aliases. `auth-mode=none` is for catalogs that are intentionally
+unauthenticated or authenticated outside iceberg-go; it prevents iceberg-go's
+empty bearer-token default from reaching strict auth gateways.
 
 ## 9. Encoder: TiDB row → Arrow record → Parquet
 

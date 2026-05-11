@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	icebergio "github.com/apache/iceberg-go/io"
+	_ "github.com/apache/iceberg-go/io/gocloud" // register s3/gs/azure/mem Iceberg IO schemes
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"

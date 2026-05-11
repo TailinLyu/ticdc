@@ -46,6 +46,7 @@ type Config struct {
 	// Optional HTTP-level overrides for the REST catalog client. Empty values
 	// keep iceberg-go defaults.
 	CatalogHostHeader string
+	CatalogAuthMode   string
 	SuppressHeaders   []string
 
 	// Optional AWS SDK knobs for REST catalog SigV4/storage clients.
@@ -87,8 +88,13 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 		BatchRows:      defaultBatchRows,
 		CatalogHostHeader: strings.TrimSpace(firstNonEmpty(
 			query.Get("catalog-host-header"), query.Get("iceberg-catalog-host-header"))),
+		CatalogAuthMode: strings.ToLower(strings.TrimSpace(firstNonEmpty(
+			query.Get("auth-mode"), query.Get("iceberg-auth-mode")))),
 		SuppressHeaders: splitCommaList(firstNonEmpty(
 			query.Get("suppress-headers"), query.Get("iceberg-suppress-headers"))),
+	}
+	if err := cfg.normalizeCatalogAuthMode(); err != nil {
+		return nil, err
 	}
 	awsOptions, err := parseAWSOptions(firstNonEmpty(
 		query.Get("aws"), query.Get("aws-options"),
@@ -165,6 +171,40 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 // TargetIdentifier maps a TiDB source table to its Iceberg table identifier.
 func (c Config) TargetIdentifier(schemaName, tableName string) []string {
 	return []string{c.DatabasePrefix + schemaName, tableName + c.TableSuffix}
+}
+
+func (c *Config) normalizeCatalogAuthMode() error {
+	switch c.CatalogAuthMode {
+	case "":
+		return nil
+	case "none":
+		c.SuppressHeaders = appendStringIfMissing(c.SuppressHeaders, "Authorization")
+		return nil
+	default:
+		return fmt.Errorf("invalid auth-mode %q: supported values are none", c.CatalogAuthMode)
+	}
+}
+
+// EffectiveSuppressHeaders returns the headers the catalog transport should
+// remove after iceberg-go has added its defaults.
+func (c *Config) EffectiveSuppressHeaders() []string {
+	if c == nil {
+		return nil
+	}
+	headers := append([]string(nil), c.SuppressHeaders...)
+	if strings.EqualFold(c.CatalogAuthMode, "none") {
+		headers = appendStringIfMissing(headers, "Authorization")
+	}
+	return headers
+}
+
+func appendStringIfMissing(values []string, want string) []string {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), want) {
+			return values
+		}
+	}
+	return append(values, want)
 }
 
 func firstNonEmpty(values ...string) string {

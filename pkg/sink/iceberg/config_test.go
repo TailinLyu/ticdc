@@ -91,6 +91,26 @@ func TestParseConfigKeepsLegacyAWSAliases(t *testing.T) {
 	require.Equal(t, "ticdc-iceberg-test", cfg.AWSUserAgent)
 }
 
+func TestParseConfigAuthModeNoneSuppressesAuthorization(t *testing.T) {
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&auth-mode=none&suppress-headers=X-Iceberg-Access-Delegation")
+	require.NoError(t, err)
+
+	cfg, err := ParseConfig(uri)
+	require.NoError(t, err)
+
+	require.Equal(t, "none", cfg.CatalogAuthMode)
+	require.Equal(t, []string{"X-Iceberg-Access-Delegation", "Authorization"}, cfg.SuppressHeaders)
+}
+
+func TestParseConfigRejectsInvalidAuthMode(t *testing.T) {
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&auth-mode=magic")
+	require.NoError(t, err)
+
+	_, err = ParseConfig(uri)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "auth-mode")
+}
+
 func TestParseConfigRejectsInvalidAWSOptions(t *testing.T) {
 	for _, raw := range []string{`{"region":`, `{"user-agent-tags":[""]}`} {
 		uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&aws=" + url.QueryEscape(raw))

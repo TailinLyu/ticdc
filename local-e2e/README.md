@@ -128,6 +128,19 @@ Supported fields are `region`, `endpoint`, `path-style-access`, and
 `user-agent-tags`. The legacy `aws-region` and `aws-user-agent` URI parameters
 remain accepted as aliases.
 
+For production REST catalogs behind a gateway that rejects malformed bearer
+tokens, add `auth-mode=none` when the catalog is intentionally unauthenticated
+or authenticated outside iceberg-go:
+
+```text
+iceberg://iceberg-rest:8181/?warehouse=s3://bucket/warehouse&staging-dir=file:///mnt/ticdc-stage&auth-mode=none
+```
+
+This suppresses iceberg-go's empty `Authorization: Bearer ` default on catalog
+requests. The lower-level `suppress-headers` option remains available for
+gateway-specific header cleanup, for example
+`suppress-headers=X-Iceberg-Access-Delegation,Authorization`.
+
 ## Querying Iceberg
 
 Go helper:

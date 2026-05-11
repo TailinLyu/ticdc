@@ -69,18 +69,22 @@ func restCatalogOptions(
 	cfg *icebergcfg.Config,
 ) (context.Context, []rest.Option, error) {
 	opts := []rest.Option{rest.WithWarehouseLocation(cfg.Warehouse)}
-	if len(cfg.SuppressHeaders) > 0 {
-		headers := make(map[string]string, len(cfg.SuppressHeaders))
-		for _, header := range cfg.SuppressHeaders {
+	suppressHeaders := cfg.EffectiveSuppressHeaders()
+	if strings.EqualFold(cfg.CatalogAuthMode, "none") {
+		opts = append(opts, rest.WithAuthManager(noAuthManager{}))
+	}
+	if len(suppressHeaders) > 0 {
+		headers := make(map[string]string, len(suppressHeaders))
+		for _, header := range suppressHeaders {
 			headers[http.CanonicalHeaderKey(header)] = ""
 		}
 		opts = append(opts, rest.WithHeaders(headers))
 	}
-	if cfg.CatalogHostHeader != "" || len(cfg.SuppressHeaders) > 0 {
+	if cfg.CatalogHostHeader != "" || len(suppressHeaders) > 0 {
 		opts = append(opts, rest.WithCustomTransport(&catalogHeaderTransport{
 			base:            http.DefaultTransport,
 			host:            cfg.CatalogHostHeader,
-			suppressHeaders: cfg.SuppressHeaders,
+			suppressHeaders: suppressHeaders,
 		}))
 	}
 	if props := cfg.IcebergS3Properties(); len(props) > 0 {
@@ -92,6 +96,12 @@ func restCatalogOptions(
 		opts = append(opts, rest.WithAwsConfig(*awsCfg))
 	}
 	return ctx, opts, nil
+}
+
+type noAuthManager struct{}
+
+func (noAuthManager) AuthHeader() (string, string, error) {
+	return "Authorization", "", nil
 }
 
 type catalogHeaderTransport struct {

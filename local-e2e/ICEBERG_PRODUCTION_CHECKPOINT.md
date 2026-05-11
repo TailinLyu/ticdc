@@ -36,6 +36,10 @@ matrix.
   `endpoint`, `path-style-access`, and `user-agent-tags`; TiCDC threads them
   into both the iceberg-go catalog/data path and the BR storage owner-marker
   path. The legacy `aws-region` and `aws-user-agent` parameters remain aliases.
+- For intentionally unauthenticated REST catalogs behind strict auth gateways,
+  `auth-mode=none` suppresses iceberg-go's empty `Authorization: Bearer `
+  default. Operators can still use `suppress-headers` for gateway-specific
+  cleanup such as `X-Iceberg-Access-Delegation` or `Authorization`.
 - JSON row staging is explicitly bounded to a local/shared filesystem path, such
   as a PVC mounted at the same path on every TiCDC capture. `s3://` is supported
   for the Iceberg warehouse and target-owner marker path, not for native staged

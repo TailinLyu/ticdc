@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	iceberggo "github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
 	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
 	"github.com/stretchr/testify/require"
@@ -126,6 +127,35 @@ func TestNewIcebergAppenderAppliesCatalogTransportOverrides(t *testing.T) {
 
 	require.Equal(t, "catalog.internal", seenHost)
 	require.Empty(t, seenHeaders.Values("X-Iceberg-Access-Delegation"))
+}
+
+func TestNewIcebergAppenderAuthModeNoneDropsAuthorization(t *testing.T) {
+	var seenHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/config" {
+			http.NotFound(w, r)
+			return
+		}
+		seenHeaders = r.Header.Clone()
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"defaults":  map[string]any{},
+			"overrides": map[string]any{},
+		}))
+	}))
+	defer server.Close()
+
+	_, err := newIcebergAppender(context.Background(), &icebergcfg.Config{
+		CatalogURI:      server.URL,
+		Warehouse:       "file:///tmp/warehouse",
+		CatalogAuthMode: "none",
+	})
+	require.NoError(t, err)
+
+	require.Empty(t, seenHeaders.Values("Authorization"))
+}
+
+func TestIcebergCloudIOSchemesAreRegistered(t *testing.T) {
+	require.Contains(t, icebergio.GetRegisteredSchemes(), "s3")
 }
 
 func TestCreateTablePropertiesMergesOperatorPropertiesWithoutOverridingManagedKeys(t *testing.T) {
