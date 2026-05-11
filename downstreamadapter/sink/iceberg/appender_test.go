@@ -24,6 +24,7 @@ import (
 	iceberggo "github.com/apache/iceberg-go"
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
+	icebergutils "github.com/apache/iceberg-go/utils"
 	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
 	"github.com/stretchr/testify/require"
 )
@@ -127,6 +128,20 @@ func TestNewIcebergAppenderAppliesCatalogTransportOverrides(t *testing.T) {
 
 	require.Equal(t, "catalog.internal", seenHost)
 	require.Empty(t, seenHeaders.Values("X-Iceberg-Access-Delegation"))
+}
+
+func TestRestCatalogOptionsPlumbsAWSConfigIntoIcebergIOContext(t *testing.T) {
+	ctx, _, err := restCatalogOptions(context.Background(), &icebergcfg.Config{
+		Warehouse:    "s3://bucket/warehouse",
+		AWSRegion:    "us-west-2",
+		AWSUserAgent: "ticdc-iceberg-test",
+	})
+	require.NoError(t, err)
+
+	awsCfg := icebergutils.GetAwsConfig(ctx)
+	require.NotNil(t, awsCfg)
+	require.Equal(t, "us-west-2", awsCfg.Region)
+	require.NotEmpty(t, awsCfg.APIOptions)
 }
 
 func TestNewIcebergAppenderAuthModeNoneDropsAuthorization(t *testing.T) {

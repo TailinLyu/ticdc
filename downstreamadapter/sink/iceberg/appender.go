@@ -27,6 +27,7 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
 	icebergtable "github.com/apache/iceberg-go/table"
+	icebergutils "github.com/apache/iceberg-go/utils"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
 	"github.com/pingcap/ticdc/pkg/errors"
@@ -94,6 +95,7 @@ func restCatalogOptions(
 		return nil, nil, errors.Trace(err)
 	} else if awsCfg != nil {
 		opts = append(opts, rest.WithAwsConfig(*awsCfg))
+		ctx = icebergutils.WithAwsConfig(ctx, awsCfg)
 	}
 	return ctx, opts, nil
 }
