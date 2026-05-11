@@ -27,6 +27,10 @@ matrix.
   S3-compatible warehouses. Non-local warehouses require an explicit local/shared
   `staging-dir` while JSON staging remains in this PR. Other cloud warehouse
   schemes are rejected instead of being silently accepted.
+- Catalog-specific Iceberg table creation properties can be supplied with
+  `table-properties` or `iceberg-table-properties` in the sink URI. They are
+  passed to `CreateTable` for catalog/vendor knobs such as location-bucket or
+  compression settings. TiCDC-managed table properties always win on conflict.
 - JSON row staging is explicitly bounded to a local/shared filesystem path, such
   as a PVC mounted at the same path on every TiCDC capture. `s3://` is supported
   for the Iceberg warehouse and target-owner marker path, not for native staged

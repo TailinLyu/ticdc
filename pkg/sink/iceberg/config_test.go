@@ -22,7 +22,7 @@ import (
 )
 
 func TestParseConfigFromSinkURI(t *testing.T) {
-	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&staging-dir=file:///tmp/ticdc-stage&database-prefix=tidb_&table-suffix=_log&commit-interval=2s&batch-rows=64&catalog-host-header=catalog.internal&suppress-headers=X-Iceberg-Access-Delegation, X-Test&aws-region=us-west-2&aws-user-agent=ticdc-iceberg-test")
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&staging-dir=file:///tmp/ticdc-stage&database-prefix=tidb_&table-suffix=_log&commit-interval=2s&batch-rows=64&catalog-host-header=catalog.internal&suppress-headers=X-Iceberg-Access-Delegation, X-Test&aws-region=us-west-2&aws-user-agent=ticdc-iceberg-test&table-properties=create_iceberg_table_location_bucket=my-bucket,write.parquet.compression-codec=zstd")
 	require.NoError(t, err)
 
 	cfg, err := ParseConfig(uri)
@@ -39,6 +39,35 @@ func TestParseConfigFromSinkURI(t *testing.T) {
 	require.Equal(t, []string{"X-Iceberg-Access-Delegation", "X-Test"}, cfg.SuppressHeaders)
 	require.Equal(t, "us-west-2", cfg.AWSRegion)
 	require.Equal(t, "ticdc-iceberg-test", cfg.AWSUserAgent)
+	require.Equal(t, map[string]string{
+		"create_iceberg_table_location_bucket": "my-bucket",
+		"write.parquet.compression-codec":      "zstd",
+	}, cfg.TableProperties)
+}
+
+func TestParseConfigAcceptsJSONTableProperties(t *testing.T) {
+	rawProperties := `{"create_iceberg_table_location_bucket":"my-bucket","write.metadata.compression-codec":"gzip"}`
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&table-properties=" + url.QueryEscape(rawProperties))
+	require.NoError(t, err)
+
+	cfg, err := ParseConfig(uri)
+	require.NoError(t, err)
+
+	require.Equal(t, map[string]string{
+		"create_iceberg_table_location_bucket": "my-bucket",
+		"write.metadata.compression-codec":     "gzip",
+	}, cfg.TableProperties)
+}
+
+func TestParseConfigRejectsInvalidTableProperties(t *testing.T) {
+	for _, raw := range []string{"missing-value", `{"bad":`} {
+		uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&table-properties=" + url.QueryEscape(raw))
+		require.NoError(t, err)
+
+		_, err = ParseConfig(uri)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "table-properties")
+	}
 }
 
 func TestParseConfigAllowsExplicitCatalogURI(t *testing.T) {

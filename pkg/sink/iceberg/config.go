@@ -14,6 +14,7 @@
 package iceberg
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -51,6 +52,10 @@ type Config struct {
 	AWSRegion    string
 	AWSUserAgent string
 
+	// TableProperties are pass-through Iceberg table properties applied at
+	// CreateTable time. Sink-managed properties win on key conflict.
+	TableProperties map[string]string
+
 	// Runtime owner identity. These fields are filled by TiCDC after parsing
 	// the sink URI and are used to reject unsupported shared-target writes.
 	TiCDCClusterID string
@@ -85,6 +90,12 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 		AWSUserAgent: strings.TrimSpace(firstNonEmpty(
 			query.Get("aws-user-agent"), query.Get("iceberg-aws-user-agent"))),
 	}
+	tableProperties, err := parseTableProperties(firstNonEmpty(
+		query.Get("table-properties"), query.Get("iceberg-table-properties")))
+	if err != nil {
+		return nil, err
+	}
+	cfg.TableProperties = tableProperties
 
 	if cfg.CatalogURI == "" {
 		if uri.Host == "" {
@@ -161,6 +172,34 @@ func splitCommaList(raw string) []string {
 		}
 	}
 	return values
+}
+
+func parseTableProperties(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(raw, "{") {
+		properties := make(map[string]string)
+		if err := json.Unmarshal([]byte(raw), &properties); err != nil {
+			return nil, fmt.Errorf("invalid table-properties JSON: %w", err)
+		}
+		return properties, nil
+	}
+	properties := make(map[string]string)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" {
+			return nil, fmt.Errorf("invalid table-properties entry %q, expected key=value", part)
+		}
+		properties[key] = strings.TrimSpace(value)
+	}
+	return properties, nil
 }
 
 func defaultStagingPath(warehouse string) (string, error) {

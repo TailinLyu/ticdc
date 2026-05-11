@@ -39,7 +39,8 @@ import (
 )
 
 type icebergAppender struct {
-	catalog catalog.Catalog
+	catalog         catalog.Catalog
+	tableProperties map[string]string
 
 	mu     sync.Mutex
 	tables map[string]*icebergtable.Table
@@ -60,8 +61,9 @@ func newIcebergAppender(ctx context.Context, cfg *icebergcfg.Config) (*icebergAp
 		return nil, errors.Trace(err)
 	}
 	return &icebergAppender{
-		catalog: cat,
-		tables:  make(map[string]*icebergtable.Table),
+		catalog:         cat,
+		tableProperties: cloneStringMap(cfg.TableProperties),
+		tables:          make(map[string]*icebergtable.Table),
 	}, nil
 }
 
@@ -499,22 +501,7 @@ func (a *icebergAppender) createTable(
 		return nil, errors.Trace(err)
 	}
 
-	props := iceberggo.Properties{
-		"format-version":       "2",
-		"write.format.default": "parquet",
-	}
-	if ownerID != "" {
-		props[tableOwnerIDKey] = ownerID
-	}
-	if changefeed != "" {
-		props[tableOwnerKey] = changefeed
-	}
-	if cdcClusterID != "" {
-		props[tableCDCClusterIDKey] = cdcClusterID
-	}
-	if upstreamID != "" {
-		props[tableUpstreamIDKey] = upstreamID
-	}
+	props := createTableProperties(a.tableProperties, ownerID, changefeed, cdcClusterID, upstreamID)
 
 	tbl, err := a.catalog.CreateTable(ctx, ident, schema,
 		catalog.WithPartitionSpec(partitionSpec),
@@ -533,6 +520,45 @@ func (a *icebergAppender) createTable(
 		return nil, fmt.Errorf("create iceberg table %q: %w", identifier, err)
 	}
 	return tbl, nil
+}
+
+func createTableProperties(
+	tableProperties map[string]string,
+	ownerID string,
+	changefeed string,
+	cdcClusterID string,
+	upstreamID string,
+) iceberggo.Properties {
+	props := make(iceberggo.Properties, len(tableProperties)+6)
+	for key, value := range tableProperties {
+		props[key] = value
+	}
+	props["format-version"] = "2"
+	props["write.format.default"] = "parquet"
+	if ownerID != "" {
+		props[tableOwnerIDKey] = ownerID
+	}
+	if changefeed != "" {
+		props[tableOwnerKey] = changefeed
+	}
+	if cdcClusterID != "" {
+		props[tableCDCClusterIDKey] = cdcClusterID
+	}
+	if upstreamID != "" {
+		props[tableUpstreamIDKey] = upstreamID
+	}
+	return props
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func ensureNamespace(ctx context.Context, cat namespaceEnsurer, namespace icebergtable.Identifier) error {

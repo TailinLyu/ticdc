@@ -106,6 +106,17 @@ iceberg://iceberg-rest:8181/?warehouse=file:///tmp/iceberg-warehouse&commit-inte
 Source tables are split into multiple TiKV regions so the new scheduler can
 assign multiple spans across local TiCDC captures.
 
+Catalog-specific Iceberg table creation properties can be passed through with
+`table-properties` or `iceberg-table-properties` in the sink URI:
+
+```text
+iceberg://iceberg-rest:8181/?warehouse=s3://bucket/warehouse&staging-dir=file:///mnt/ticdc-stage&table-properties=create_iceberg_table_location_bucket=my-bucket,write.parquet.compression-codec=zstd
+```
+
+These properties are merged only when TiCDC creates the Iceberg table. TiCDC's
+managed properties, including `format-version`, `write.format.default`, and
+owner/audit keys, win if an operator-supplied key conflicts.
+
 ## Querying Iceberg
 
 Go helper:

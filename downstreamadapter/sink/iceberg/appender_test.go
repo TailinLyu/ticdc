@@ -127,3 +127,21 @@ func TestNewIcebergAppenderAppliesCatalogTransportOverrides(t *testing.T) {
 	require.Equal(t, "catalog.internal", seenHost)
 	require.Empty(t, seenHeaders.Values("X-Iceberg-Access-Delegation"))
 }
+
+func TestCreateTablePropertiesMergesOperatorPropertiesWithoutOverridingManagedKeys(t *testing.T) {
+	props := createTableProperties(map[string]string{
+		"create_iceberg_table_location_bucket": "my-bucket",
+		"write.parquet.compression-codec":      "zstd",
+		"format-version":                       "1",
+		tableOwnerIDKey:                        "other-owner",
+	}, "owner-a", "default/cf", "cluster-a", "1001")
+
+	require.Equal(t, "my-bucket", props["create_iceberg_table_location_bucket"])
+	require.Equal(t, "zstd", props["write.parquet.compression-codec"])
+	require.Equal(t, "2", props["format-version"])
+	require.Equal(t, "parquet", props["write.format.default"])
+	require.Equal(t, "owner-a", props[tableOwnerIDKey])
+	require.Equal(t, "default/cf", props[tableOwnerKey])
+	require.Equal(t, "cluster-a", props[tableCDCClusterIDKey])
+	require.Equal(t, "1001", props[tableUpstreamIDKey])
+}
