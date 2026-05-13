@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -60,6 +61,9 @@ type Config struct {
 	// TableProperties are pass-through Iceberg table properties applied at
 	// CreateTable time. Sink-managed properties win on key conflict.
 	TableProperties map[string]string
+	// OwnerMarkerPrefix is the warehouse-relative directory used for target
+	// owner markers. It defaults to defaultTargetOwnerDir.
+	OwnerMarkerPrefix string
 
 	// Runtime owner identity. These fields are filled by TiCDC after parsing
 	// the sink URI and are used to reject unsupported shared-target writes.
@@ -116,6 +120,12 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 		return nil, err
 	}
 	cfg.TableProperties = tableProperties
+	ownerMarkerPrefix, err := normalizeOwnerMarkerPrefix(firstNonEmpty(
+		query.Get("owner-marker-prefix"), query.Get("iceberg-owner-marker-prefix")))
+	if err != nil {
+		return nil, err
+	}
+	cfg.OwnerMarkerPrefix = ownerMarkerPrefix
 
 	if cfg.CatalogURI == "" {
 		if uri.Host == "" {
@@ -166,6 +176,27 @@ func ParseConfig(uri *url.URL) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func normalizeOwnerMarkerPrefix(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultTargetOwnerDir, nil
+	}
+	if strings.HasPrefix(raw, "/") {
+		return "", fmt.Errorf("invalid owner-marker-prefix %q: must be a relative warehouse path", raw)
+	}
+	trimmed := strings.Trim(raw, "/")
+	for _, segment := range strings.Split(trimmed, "/") {
+		if segment == ".." {
+			return "", fmt.Errorf("invalid owner-marker-prefix %q: must not contain parent path segments", raw)
+		}
+	}
+	cleaned := path.Clean(trimmed)
+	if cleaned == "." || cleaned == "" {
+		return "", fmt.Errorf("invalid owner-marker-prefix %q: must not resolve to warehouse root", raw)
+	}
+	return cleaned, nil
 }
 
 // TargetIdentifier maps a TiDB source table to its Iceberg table identifier.

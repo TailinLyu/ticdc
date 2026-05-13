@@ -16,6 +16,7 @@ package messaging
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/config"
@@ -47,4 +48,29 @@ func TestRemoteTargetNewMessage(t *testing.T) {
 	msg2 := rt.newMessage(msg)
 	log.Info("msg2", zap.Any("msg2", msg2))
 	require.Equal(t, TypeMessageHandShake, IOType(msg2.Type))
+}
+
+func TestRemoteTargetReconnectBackoffSuppressesImmediateRetry(t *testing.T) {
+	rt := &remoteMessageTarget{}
+	now := time.Unix(10, 0)
+
+	oldBackoff := remoteTargetReconnectBackoff
+	defer func() {
+		remoteTargetReconnectBackoff = oldBackoff
+	}()
+	remoteTargetReconnectBackoff = func(attempt int) time.Duration {
+		return time.Duration(attempt) * time.Second
+	}
+
+	require.True(t, rt.canResetConnection(now))
+	rt.noteReconnectFailure(now)
+	require.False(t, rt.canResetConnection(now.Add(500*time.Millisecond)))
+	require.True(t, rt.canResetConnection(now.Add(time.Second)))
+
+	rt.noteReconnectFailure(now.Add(time.Second))
+	require.False(t, rt.canResetConnection(now.Add(2*time.Second)))
+	require.True(t, rt.canResetConnection(now.Add(3*time.Second)))
+
+	rt.noteReconnectSuccess()
+	require.True(t, rt.canResetConnection(now.Add(1500*time.Millisecond)))
 }

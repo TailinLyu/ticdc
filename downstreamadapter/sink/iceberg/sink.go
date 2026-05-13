@@ -16,6 +16,8 @@ package iceberg
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -25,6 +27,7 @@ import (
 
 	iceberggo "github.com/apache/iceberg-go"
 	icebergrest "github.com/apache/iceberg-go/catalog/rest"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
 	"github.com/pingcap/ticdc/pkg/common"
@@ -157,13 +160,43 @@ const (
 	tableCDCClusterIDKey       = snapshotCDCClusterIDKey
 	tableUpstreamIDKey         = snapshotUpstreamIDKey
 
-	maxStagedFilesPerCommit = 100
-	maxRowsPerCommit        = 5000
-	maxCommittedRowIDCache  = maxRowsPerCommit * 4
-	maxCommitConflictRetry  = 3
+	maxStagedFilesPerCommit  = 100
+	maxRowsPerCommit         = 5000
+	maxCommittedRowIDCache   = maxRowsPerCommit * 4
+	maxCommitConflictRetry   = 3
+	commitConflictBackoffMin = 100 * time.Millisecond
+	commitConflictBackoffMax = 30 * time.Second
 )
 
 var errIcebergTargetOwnerConflict = icebergcfg.ErrTargetOwnerConflict
+
+var icebergCommitConflictRetryBackoff = func(attempt int) time.Duration {
+	if attempt <= 0 {
+		return commitConflictBackoffMin
+	}
+	backoff := commitConflictBackoffMin
+	for i := 1; i < attempt; i++ {
+		backoff *= 2
+		if backoff >= commitConflictBackoffMax {
+			return commitConflictBackoffMax
+		}
+	}
+	return backoff
+}
+
+var sleepIcebergCommitRetry = func(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 // Verify validates iceberg sink configuration. Catalog/table existence is
 // checked lazily by the running sink so changefeed creation does not depend on
@@ -500,6 +533,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 	writer, err := s.getWriter(ctx)
 	if err != nil {
 		s.recordAppendFailure("writer_init")
+		if isPermanentIcebergFailure(err) {
+			return errors.Trace(err)
+		}
 		log.Warn("iceberg committer will retry after writer initialization failure",
 			zap.String("changefeed", s.changefeedID.String()),
 			zap.Error(err))
@@ -559,6 +595,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		committedBatches, err := s.committedBatches(ctx, writer, identifierByKey[key], batchIDs)
 		if err != nil {
 			s.recordAppendFailure("committed_batch_lookup")
+			if isPermanentIcebergFailure(err) {
+				return errors.Trace(err)
+			}
 			log.Warn("iceberg committer will retry after committed batch lookup failure",
 				zap.String("changefeed", s.changefeedID.String()),
 				zap.Strings("identifier", identifierByKey[key]),
@@ -695,6 +734,9 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 				s.recordTargetOwnerConflict(err)
 				return errors.Trace(err)
 			}
+			if isPermanentIcebergFailure(err) {
+				return errors.Trace(err)
+			}
 			committed, checkErr := allBatchesCommitted(ctx, writer, group.identifier, group.batchIDs)
 			if checkErr == nil && committed {
 				if err := s.markBatchesCommitted(ctx, group.identifier, group.batchIDs, group.maxCommitTs, len(group.rows)); err != nil {
@@ -801,6 +843,9 @@ func (s *sink) appendRowsWithCommitConflictRetry(
 			zap.Int("attempt", attempt+1),
 			zap.Int("maxAttempts", maxCommitConflictRetry+1),
 			zap.Error(err))
+		if sleepErr := sleepIcebergCommitRetry(ctx, icebergCommitConflictRetryBackoff(attempt+1)); sleepErr != nil {
+			return writer, errors.Trace(sleepErr)
+		}
 		s.resetWriter()
 		nextWriter, getErr := s.getWriter(ctx)
 		if getErr != nil {
@@ -1066,6 +1111,19 @@ func (s *sink) releaseTargetCommitterLeases() {
 	}
 }
 
+func (s *sink) shouldDrainStaged() bool {
+	if s.isCommitter.Load() {
+		return true
+	}
+	session, ok := appcontext.GetServiceIfExists[*concurrency.Session](appcontext.EtcdSession)
+	if !ok || session == nil {
+		return true
+	}
+	s.ownerClaimsMu.Lock()
+	defer s.ownerClaimsMu.Unlock()
+	return len(s.ownerLeases) > 0
+}
+
 func (s *sink) recordStageMetrics(stagedFiles []stagedFile, eligible []stagedFile) {
 	keyspace, changefeed := s.changefeedID.Keyspace(), s.changefeedID.Name()
 	pendingRows := stagedRows(stagedFiles)
@@ -1152,6 +1210,28 @@ func appendFailureReason(err error) string {
 
 func isIcebergCommitFailed(err error) bool {
 	return errors.Is(err, icebergrest.ErrCommitFailed) || errors.Cause(err) == icebergrest.ErrCommitFailed
+}
+
+func isPermanentIcebergFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, icebergrest.ErrBadRequest) ||
+		errors.Is(err, icebergrest.ErrUnauthorized) ||
+		errors.Is(err, icebergrest.ErrForbidden) ||
+		errors.Is(err, icebergrest.ErrAuthorizationExpired) {
+		return true
+	}
+	var responseErr *smithyhttp.ResponseError
+	if stderrors.As(err, &responseErr) {
+		status := responseErr.HTTPStatusCode()
+		return status >= http.StatusBadRequest &&
+			status < http.StatusInternalServerError &&
+			status != http.StatusRequestTimeout &&
+			status != http.StatusConflict &&
+			status != http.StatusTooManyRequests
+	}
+	return false
 }
 
 func (s *sink) recordCleanupFailure(reason string) {
@@ -1365,16 +1445,35 @@ func (s *sink) stageAllAndDrain(ctx context.Context, buffers map[string]*tableBu
 	if err := s.stageAll(ctx, buffers); err != nil {
 		return errors.Trace(err)
 	}
-	if s.isCommitter.Load() {
+	if s.shouldDrainStaged() {
 		failpoint.Inject("IcebergSinkBlockBeforeDrain", nil)
 		if err := s.drainStaged(ctx, checkpointTs); err != nil {
 			return errors.Trace(err)
 		}
 	}
 	if checkpointTs != 0 && checkpointTs >= s.latestCheckpointTs.Load() {
-		s.checkpointPending.Store(false)
+		hasEligible, err := s.hasEligibleStagedFiles(ctx, checkpointTs)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if !hasEligible {
+			s.checkpointPending.Store(false)
+		}
 	}
 	return nil
+}
+
+func (s *sink) hasEligibleStagedFiles(ctx context.Context, checkpointTs uint64) (bool, error) {
+	stagedFiles, err := s.stage.List(ctx, s.changefeedID.String())
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	for _, staged := range stagedFiles {
+		if staged.batch.MaxCommitTs <= checkpointTs {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *sink) stageTable(ctx context.Context, buffers map[string]*tableBuffer, key string) error {

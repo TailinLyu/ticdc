@@ -31,7 +31,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/storage"
 )
 
-const targetOwnerDir = ".ticdc/iceberg-target-owners"
+const defaultTargetOwnerDir = ".ticdc/iceberg-target-owners"
 
 var ErrTargetOwnerConflict = stderrors.New(
 	"unsupported iceberg target owner conflict: one iceberg target table cannot be shared by multiple changefeeds")
@@ -74,19 +74,20 @@ func TargetOwnerID(cdcClusterID string, upstreamID uint64, changefeed string) st
 }
 
 func ClaimTargetOwner(ctx context.Context, warehouse string, claim TargetOwnerClaim) error {
-	return claimTargetOwner(ctx, warehouse, claim)
+	return claimTargetOwner(ctx, warehouse, defaultTargetOwnerDir, claim)
 }
 
 func ClaimTargetOwnerWithConfig(ctx context.Context, cfg *Config, claim TargetOwnerClaim) error {
 	if cfg == nil {
 		return fmt.Errorf("nil iceberg sink config")
 	}
-	return claimTargetOwner(ctx, cfg.Warehouse, claim, cfg.externalStorageOptions()...)
+	return claimTargetOwner(ctx, cfg.Warehouse, cfg.OwnerMarkerPrefix, claim, cfg.externalStorageOptions()...)
 }
 
 func claimTargetOwner(
 	ctx context.Context,
 	warehouse string,
+	ownerDir string,
 	claim TargetOwnerClaim,
 	storageOptions ...util.ExternalStorageOption,
 ) error {
@@ -103,7 +104,7 @@ func claimTargetOwner(
 	}
 	defer store.Close()
 
-	markerPath := targetOwnerMarkerPath(claim.Identifier)
+	markerPath := targetOwnerMarkerPath(ownerMarkerDir(ownerDir), claim.Identifier)
 	hint, err := json.Marshal(claim)
 	if err != nil {
 		return err
@@ -130,8 +131,7 @@ func claimTargetOwner(
 			if exists {
 				return validateTargetOwnerClaim(existing, claim)
 			}
-			lastErr = fmt.Errorf("claim iceberg target owner %q: %w; owner marker not visible yet",
-				markerPath, lockErr)
+			lastErr = targetOwnerClaimRetryError(markerPath, lockErr)
 		}
 
 		select {
@@ -141,6 +141,14 @@ func claimTargetOwner(
 		}
 	}
 	return lastErr
+}
+
+func targetOwnerClaimRetryError(markerPath string, lockErr error) error {
+	if isTargetOwnerMarkerMissing(lockErr) {
+		return fmt.Errorf("claim iceberg target owner %q: owner marker not visible after lock attempt", markerPath)
+	}
+	return fmt.Errorf("claim iceberg target owner %q: lock attempt failed and owner marker was not visible: %w",
+		markerPath, lockErr)
 }
 
 func readTargetOwnerClaimIfExists(
@@ -167,19 +175,20 @@ func readTargetOwnerClaimIfExists(
 }
 
 func CleanupTargetOwnerClaims(ctx context.Context, warehouse string, ownerID string) error {
-	return cleanupWarehouseTargetOwnerClaims(ctx, warehouse, ownerID)
+	return cleanupWarehouseTargetOwnerClaims(ctx, warehouse, defaultTargetOwnerDir, ownerID)
 }
 
 func CleanupTargetOwnerClaimsWithConfig(ctx context.Context, cfg *Config, ownerID string) error {
 	if cfg == nil {
 		return fmt.Errorf("nil iceberg sink config")
 	}
-	return cleanupWarehouseTargetOwnerClaims(ctx, cfg.Warehouse, ownerID, cfg.externalStorageOptions()...)
+	return cleanupWarehouseTargetOwnerClaims(ctx, cfg.Warehouse, cfg.OwnerMarkerPrefix, ownerID, cfg.externalStorageOptions()...)
 }
 
 func cleanupWarehouseTargetOwnerClaims(
 	ctx context.Context,
 	warehouse string,
+	ownerDir string,
 	ownerID string,
 	storageOptions ...util.ExternalStorageOption,
 ) error {
@@ -192,7 +201,7 @@ func cleanupWarehouseTargetOwnerClaims(
 	}
 	defer store.Close()
 
-	err = store.WalkDir(ctx, &storage.WalkOption{SubDir: targetOwnerDir}, func(path string, _ int64) error {
+	err = store.WalkDir(ctx, &storage.WalkOption{SubDir: ownerMarkerDir(ownerDir)}, func(path string, _ int64) error {
 		claim, err := readTargetOwnerClaim(ctx, store, path)
 		if err != nil {
 			if isTargetOwnerMarkerMissing(err) {
@@ -239,9 +248,17 @@ func validateTargetOwnerClaim(existing TargetOwnerClaim, expected TargetOwnerCla
 		ErrTargetOwnerConflict, existing.OwnerID, expected.OwnerID, targetIdentifierKey(expected.Identifier))
 }
 
-func targetOwnerMarkerPath(identifier []string) string {
+func targetOwnerMarkerPath(ownerDir string, identifier []string) string {
 	sum := sha256.Sum256([]byte(targetIdentifierKey(identifier)))
-	return path.Join(targetOwnerDir, hex.EncodeToString(sum[:])+".lock")
+	return path.Join(ownerMarkerDir(ownerDir), hex.EncodeToString(sum[:])+".lock")
+}
+
+func ownerMarkerDir(ownerDir string) string {
+	ownerDir = strings.TrimSpace(ownerDir)
+	if ownerDir == "" {
+		return defaultTargetOwnerDir
+	}
+	return ownerDir
 }
 
 func targetIdentifierKey(identifier []string) string {

@@ -88,6 +88,37 @@ func TestCleanupRemovedChangefeedSinkArtifactsRemovesIcebergWarehouseOwnerClaim(
 	require.NoError(t, icebergcfg.ClaimTargetOwner(ctx, warehouse, recreated))
 }
 
+func TestCleanupRemovedChangefeedSinkArtifactsUsesOwnerMarkerPrefix(t *testing.T) {
+	ctx := context.Background()
+	stagingDir := t.TempDir()
+	warehouse := (&url.URL{Scheme: "file", Path: t.TempDir()}).String()
+	id := common.NewChangeFeedIDWithName("iceberg-left", common.DefaultKeyspaceName)
+	upstreamID := uint64(1001)
+	identifier := []string{"test", "orders_cdc"}
+	cfg := &icebergcfg.Config{
+		Warehouse:         warehouse,
+		OwnerMarkerPrefix: "allowed/ticdc-locks",
+	}
+	owner := icebergcfg.NewTargetOwnerClaim(
+		config.GetGlobalServerConfig().ClusterID,
+		upstreamID,
+		id.String(),
+		identifier)
+	require.NoError(t, icebergcfg.ClaimTargetOwnerWithConfig(ctx, cfg, owner))
+
+	icebergURI := url.URL{Scheme: "iceberg", Host: "localhost:8181"}
+	query := icebergURI.Query()
+	query.Set("warehouse", warehouse)
+	query.Set("staging-dir", (&url.URL{Scheme: "file", Path: stagingDir}).String())
+	query.Set("owner-marker-prefix", cfg.OwnerMarkerPrefix)
+	icebergURI.RawQuery = query.Encode()
+
+	cleanupRemovedChangefeedSinkArtifacts(id, icebergURI.String(), upstreamID)
+
+	recreated := icebergcfg.NewTargetOwnerClaim("other-cdc", 2002, "default/iceberg-recreated", identifier)
+	require.NoError(t, icebergcfg.ClaimTargetOwnerWithConfig(ctx, cfg, recreated))
+}
+
 func coordinatorTestPathSegment(value string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(value))
 }

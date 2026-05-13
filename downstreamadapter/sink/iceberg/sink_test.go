@@ -194,6 +194,21 @@ type flakyCommitWriter struct {
 	failures int
 }
 
+type permanentAppendErrorWriter struct {
+	recordingAppendWriter
+	err error
+}
+
+func (w *permanentAppendErrorWriter) AppendRows(
+	context.Context,
+	[]string,
+	[]map[string]any,
+	*stagedTableSchema,
+	iceberggo.Properties,
+) error {
+	return w.err
+}
+
 type schemaUpdateCall struct {
 	identifier   []string
 	tableInfo    *common.TableInfo
@@ -303,6 +318,34 @@ func TestSinkFlushesRowsOnCheckpoint(t *testing.T) {
 	require.Equal(t, "1", calls[0].props["ticdc.commit-ts"])
 	require.Eventually(t, func() bool {
 		return stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+func TestDataDispatcherDrainsOwnStagedRowsOnCheckpoint(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-data-dispatcher"), cfg, writer)
+
+	tableInfo := newPayloadTestTableInfo()
+	tableInfo.TableName = common.TableName{Schema: "test", Table: "orders", TableID: 101}
+	event := newSinkTestInsertEvent(tableInfo, 10, int64(1), "first")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddDMLEvent(event)
+	s.AddCheckpointTs(10)
+
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
 	}, 3*time.Second, 10*time.Millisecond)
 
 	cancel()
@@ -1457,6 +1500,25 @@ func TestAddCheckpointTsDrainsPendingCheckpointWhenCommandChannelFull(t *testing
 	require.NoError(t, <-errCh)
 }
 
+func TestCheckpointPendingRemainsWhenEligibleStagedRowsAreUncommitted(t *testing.T) {
+	ctx := context.Background()
+	writer := &recordingAppendWriter{err: stderrors.New("persistent append failure")}
+	cfg := newSinkTestConfig(t, 1024)
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-checkpoint-pending"), cfg, writer)
+
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, s.stage.Write(ctx, s.changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+	s.latestCheckpointTs.Store(10)
+	s.checkpointPending.Store(true)
+
+	require.NoError(t, s.stageAllAndDrain(ctx, map[string]*tableBuffer{}, 10))
+
+	require.True(t, s.checkpointPending.Load())
+	require.Equal(t, 1, stageFileCount(t, cfg.StagingDir))
+}
+
 func TestSinkRecordsIcebergStagedBacklogMetrics(t *testing.T) {
 	ctx := context.Background()
 	cfg := newSinkTestConfig(t, 1024)
@@ -1567,6 +1629,59 @@ func TestCommitterRetriesIcebergCommitFailedInSameDrain(t *testing.T) {
 
 	require.Len(t, writer.getCalls(), 1)
 	require.Equal(t, 0, stageFileCount(t, cfg.StagingDir))
+}
+
+func TestCommitterBacksOffBetweenCommitConflictRetries(t *testing.T) {
+	ctx := context.Background()
+	cfg := newSinkTestConfig(t, 1024)
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-cas-backoff")
+	writer := &flakyCommitWriter{failures: 2}
+	s := newSink(ctx, changefeedID, cfg, writer)
+
+	oldBackoff := icebergCommitConflictRetryBackoff
+	oldSleep := sleepIcebergCommitRetry
+	defer func() {
+		icebergCommitConflictRetryBackoff = oldBackoff
+		sleepIcebergCommitRetry = oldSleep
+	}()
+
+	var backoffAttempts []int
+	var sleeps []time.Duration
+	icebergCommitConflictRetryBackoff = func(attempt int) time.Duration {
+		backoffAttempts = append(backoffAttempts, attempt)
+		return time.Duration(attempt) * time.Millisecond
+	}
+	sleepIcebergCommitRetry = func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		return nil
+	}
+
+	_, err := s.appendRowsWithCommitConflictRetry(ctx, writer, &stagedDrainGroup{
+		identifier: []string{"test", "orders_cdc"},
+		rows:       []map[string]any{{"data": map[string]any{"id": int64(1)}}},
+		batchIDs:   []string{"batch-1"},
+	}, iceberggo.Properties{snapshotBatchIDKey: "batch-1"})
+
+	require.NoError(t, err)
+	require.Equal(t, []int{1, 2}, backoffAttempts)
+	require.Equal(t, []time.Duration{time.Millisecond, 2 * time.Millisecond}, sleeps)
+}
+
+func TestCommitterReturnsPermanentAuthorizationFailure(t *testing.T) {
+	ctx := context.Background()
+	cfg := newSinkTestConfig(t, 1024)
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-auth-failure")
+	writer := &permanentAppendErrorWriter{err: fmt.Errorf("catalog denied: %w", icebergrest.ErrForbidden)}
+	s := newSink(ctx, changefeedID, cfg, writer)
+
+	identifier := []string{"test", "orders_cdc"}
+	require.NoError(t, s.stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+
+	err := s.drainStaged(ctx, 10)
+	require.ErrorIs(t, err, icebergrest.ErrForbidden)
+	require.Equal(t, 1, stageFileCount(t, cfg.StagingDir))
 }
 
 func TestClosePreservesOwnerConflictMetricUntilRemove(t *testing.T) {

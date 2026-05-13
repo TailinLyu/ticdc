@@ -15,6 +15,7 @@ package version
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/pingcap/log"
@@ -29,6 +30,7 @@ var (
 	GitHash        = "None"
 	GitBranch      = "None"
 	GoVersion      = "None"
+	FailpointBuild = "false"
 )
 
 // ReleaseSemver returns a valid Semantic Versions or an empty if the
@@ -42,6 +44,15 @@ func ReleaseSemver() string {
 	return v.String()
 }
 
+func IsFailpointBuild() bool {
+	switch strings.ToLower(strings.TrimSpace(FailpointBuild)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // LogVersionInfo prints the CDC version information.
 func LogVersionInfo(app string) {
 	log.Info("Welcome to "+app,
@@ -50,7 +61,7 @@ func LogVersionInfo(app string) {
 		zap.String("git-branch", GitBranch),
 		zap.String("utc-build-time", BuildTS),
 		zap.String("go-version", GoVersion),
-		zap.Bool("failpoint-build", false),
+		zap.Bool("failpoint-build", IsFailpointBuild()),
 		zap.String("kernel-type", kerneltype.Name()),
 	)
 }
@@ -63,7 +74,7 @@ func GetRawInfo() string {
 	info += fmt.Sprintf("Git Branch: %s\n", GitBranch)
 	info += fmt.Sprintf("UTC Build Time: %s\n", BuildTS)
 	info += fmt.Sprintf("Go Version: %s\n", GoVersion)
-	info += fmt.Sprintf("Failpoint Build: %t\n", false)
+	info += fmt.Sprintf("Failpoint Build: %t\n", IsFailpointBuild())
 	info += fmt.Sprintf("Kernel Type: %s\n", kerneltype.Name())
 	return info
 }

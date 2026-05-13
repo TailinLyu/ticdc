@@ -36,9 +36,10 @@ import (
 )
 
 const (
-	reconnectInterval = 2 * time.Second
-	streamTypeEvent   = "event"
-	streamTypeCommand = "command"
+	reconnectInterval   = 2 * time.Second
+	maxReconnectBackoff = 30 * time.Second
+	streamTypeEvent     = "event"
+	streamTypeCommand   = "command"
 
 	eventRecvCh   = "eventRecvCh"
 	commandRecvCh = "commandRecvCh"
@@ -99,6 +100,24 @@ type remoteMessageTarget struct {
 	// If true, it will initiate the connection to the remote target
 	// If false, it will wait for the remote target to initiate the connection
 	isInitiator bool
+
+	reconnectMu       sync.Mutex
+	reconnectFailures int
+	nextReconnectAt   time.Time
+}
+
+var remoteTargetReconnectBackoff = func(attempt int) time.Duration {
+	if attempt <= 0 {
+		return reconnectInterval
+	}
+	backoff := reconnectInterval
+	for i := 1; i < attempt; i++ {
+		backoff *= 2
+		if backoff >= maxReconnectBackoff {
+			return maxReconnectBackoff
+		}
+	}
+	return backoff
 }
 
 // Check if this target is ready to send messages
@@ -396,6 +415,10 @@ func (s *remoteMessageTarget) resetConnect() {
 	if !s.isInitiator {
 		return
 	}
+	now := time.Now()
+	if !s.canResetConnection(now) {
+		return
+	}
 	log.Info("start to reset connection to remote target",
 		zap.Stringer("localID", s.messageCenterID),
 		zap.String("localAddr", s.localAddr),
@@ -418,7 +441,10 @@ LOOP:
 	err := s.connect()
 	if err != nil {
 		log.Error("Failed to connect to remote target", zap.Error(err))
+		s.noteReconnectFailure(time.Now())
 		s.collectErr(err)
+	} else {
+		s.noteReconnectSuccess()
 	}
 
 	log.Info("reset connection to remote target done",
@@ -426,6 +452,26 @@ LOOP:
 		zap.String("localAddr", s.localAddr),
 		zap.Any("remoteID", s.targetId),
 		zap.String("remoteAddr", s.targetAddr))
+}
+
+func (s *remoteMessageTarget) canResetConnection(now time.Time) bool {
+	s.reconnectMu.Lock()
+	defer s.reconnectMu.Unlock()
+	return s.nextReconnectAt.IsZero() || !now.Before(s.nextReconnectAt)
+}
+
+func (s *remoteMessageTarget) noteReconnectFailure(now time.Time) {
+	s.reconnectMu.Lock()
+	defer s.reconnectMu.Unlock()
+	s.reconnectFailures++
+	s.nextReconnectAt = now.Add(remoteTargetReconnectBackoff(s.reconnectFailures))
+}
+
+func (s *remoteMessageTarget) noteReconnectSuccess() {
+	s.reconnectMu.Lock()
+	defer s.reconnectMu.Unlock()
+	s.reconnectFailures = 0
+	s.nextReconnectAt = time.Time{}
 }
 
 // Handle an incoming stream connection from a remote node, it will block until remote cancel the stream.

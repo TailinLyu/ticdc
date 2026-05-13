@@ -54,7 +54,7 @@ func cleanupRemovedChangefeedSinkArtifacts(id common.ChangeFeedID, sinkURI strin
 			zap.Error(err))
 	}
 	ownerID := icebergcfg.TargetOwnerID(config.GetGlobalServerConfig().ClusterID, upstreamID, id.String())
-	if err := icebergcfg.CleanupTargetOwnerClaims(context.Background(), cfg.Warehouse, ownerID); err != nil {
+	if err := icebergcfg.CleanupTargetOwnerClaimsWithConfig(context.Background(), cfg, ownerID); err != nil {
 		log.Warn("failed to clean removed iceberg warehouse target owner claim",
 			zap.Stringer("changefeed", id),
 			zap.String("ownerID", ownerID),

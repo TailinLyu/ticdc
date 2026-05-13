@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	pingcaperrors "github.com/pingcap/errors"
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/stretchr/testify/require"
 )
@@ -68,6 +70,27 @@ func TestClaimTargetOwnerAllowsOnlyOneConcurrentOwner(t *testing.T) {
 	assertExactlyOneConcurrentOwner(t, ctx, warehouse, []string{"db", "orders_concurrent_cdc"})
 }
 
+func TestClaimTargetOwnerWithConfigUsesOwnerMarkerPrefix(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := &Config{
+		Warehouse:         (&url.URL{Scheme: "file", Path: root}).String(),
+		OwnerMarkerPrefix: "allowed/ticdc-locks",
+	}
+	identifier := []string{"db", "orders_cdc"}
+	claim := NewTargetOwnerClaim("cdc-a", 1001, "default/left", identifier)
+
+	require.NoError(t, ClaimTargetOwnerWithConfig(ctx, cfg, claim))
+
+	customMarkerPath := filepath.Join(root, targetOwnerMarkerPath(cfg.OwnerMarkerPrefix, identifier))
+	_, err := os.Stat(customMarkerPath)
+	require.NoError(t, err)
+
+	defaultMarkerPath := filepath.Join(root, targetOwnerMarkerPath(defaultTargetOwnerDir, identifier))
+	_, err = os.Stat(defaultMarkerPath)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestTargetOwnerIDIncludesUpstreamCluster(t *testing.T) {
 	require.NotEqual(t,
 		TargetOwnerID("cdc", 1001, "default/orders"),
@@ -84,6 +107,25 @@ func TestReadTargetOwnerClaimIfExistsSkipsMissingRead(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 	require.Equal(t, 0, store.readCalls)
+}
+
+func TestTargetOwnerClaimRetryErrorHidesExpectedMissingMarkerDetail(t *testing.T) {
+	err := targetOwnerClaimRetryError(
+		"locks/db.lock",
+		pingcaperrors.Annotatef(os.ErrNotExist, "failed to read existed lock file %s", "locks/db.lock"),
+	)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "owner marker not visible after lock attempt")
+	require.NotContains(t, err.Error(), "failed to read existed lock file")
+}
+
+func TestTargetOwnerClaimRetryErrorKeepsUnexpectedLockError(t *testing.T) {
+	baseErr := errors.New("access denied")
+	err := targetOwnerClaimRetryError("locks/db.lock", baseErr)
+
+	require.ErrorIs(t, err, baseErr)
+	require.Contains(t, err.Error(), "lock attempt failed")
 }
 
 func TestClaimTargetOwnerAgainstMinIO(t *testing.T) {

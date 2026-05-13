@@ -91,6 +91,27 @@ func TestParseConfigKeepsLegacyAWSAliases(t *testing.T) {
 	require.Equal(t, "ticdc-iceberg-test", cfg.AWSUserAgent)
 }
 
+func TestParseConfigAcceptsOwnerMarkerPrefix(t *testing.T) {
+	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&owner-marker-prefix=allowed/ticdc-locks/")
+	require.NoError(t, err)
+
+	cfg, err := ParseConfig(uri)
+	require.NoError(t, err)
+
+	require.Equal(t, "allowed/ticdc-locks", cfg.OwnerMarkerPrefix)
+}
+
+func TestParseConfigRejectsUnsafeOwnerMarkerPrefix(t *testing.T) {
+	for _, raw := range []string{"/absolute/path", "../escape", "safe/../escape", "safe/../../escape"} {
+		uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&owner-marker-prefix=" + url.QueryEscape(raw))
+		require.NoError(t, err)
+
+		_, err = ParseConfig(uri)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "owner-marker-prefix")
+	}
+}
+
 func TestParseConfigAuthModeNoneSuppressesAuthorization(t *testing.T) {
 	uri, err := url.Parse("iceberg://localhost:8181/?warehouse=file:///tmp/iceberg-warehouse&auth-mode=none&suppress-headers=X-Iceberg-Access-Delegation")
 	require.NoError(t, err)

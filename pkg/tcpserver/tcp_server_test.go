@@ -192,15 +192,15 @@ func makeCredential4Testing(t *testing.T) *security.Credential {
 }
 
 func testWithHTTPWorkload(_ context.Context, t *testing.T, server TCPServer, addr string, credentials *security.Credential) {
-	httpServer := &http.Server{}
-	http.HandleFunc("/", func(writer http.ResponseWriter, _ *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(200)
 		_, err := writer.Write([]byte("ok"))
 		require.NoError(t, err)
 	})
-	defer func() {
-		http.DefaultServeMux = http.NewServeMux()
-	}()
+	httpServer := &http.Server{
+		Handler: mux,
+	}
 
 	var wg sync.WaitGroup
 
@@ -231,6 +231,7 @@ func testWithHTTPWorkload(_ context.Context, t *testing.T, server TCPServer, add
 		_ = resp.Body.Close()
 	}()
 	require.Equal(t, 200, resp.StatusCode)
+	require.Equal(t, 1, resp.ProtoMajor)
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
