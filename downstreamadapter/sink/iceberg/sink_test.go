@@ -352,6 +352,87 @@ func TestDataDispatcherDrainsOwnStagedRowsOnCheckpoint(t *testing.T) {
 	require.NoError(t, <-errCh)
 }
 
+func TestDataDispatcherWithEtcdSessionDrainsWhenItOwnsLease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	setupEtcdCommitterLease(t, ctx, "cdc-a")
+
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-data-dispatcher-lease"), cfg, writer)
+	defer s.Close(false)
+
+	tableInfo := newPayloadTestTableInfo()
+	tableInfo.TableName = common.TableName{Schema: "test", Table: "orders", TableID: 101}
+	identifier := cfg.TargetIdentifier(tableInfo.TableName.Schema, tableInfo.TableName.Table)
+	ownsLease, err := s.claimTargetCommitterLease(ctx, identifier)
+	require.NoError(t, err)
+	require.True(t, ownsLease)
+
+	event := newSinkTestInsertEvent(tableInfo, 10, int64(1), "first")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddDMLEvent(event)
+	s.AddCheckpointTs(10)
+
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+	require.False(t, s.isCommitter.Load())
+
+	s.ownerClaimsMu.Lock()
+	leaseCount := len(s.ownerLeases)
+	s.ownerClaimsMu.Unlock()
+	require.Positive(t, leaseCount)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+func TestSameOwnerSinkWithoutEtcdLeaseDoesNotDrainStagedRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	setupEtcdCommitterLease(t, ctx, "cdc-a")
+
+	cfg := newSinkTestConfig(t, 1024)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-same-owner-lease")
+	identifier := []string{"test", "orders_cdc"}
+
+	leaseHolder := newSink(ctx, changefeedID, cfg, &recordingAppendWriter{})
+	defer leaseHolder.Close(false)
+	ownsLease, err := leaseHolder.claimTargetOwnerForDrain(ctx, identifier)
+	require.NoError(t, err)
+	require.True(t, ownsLease)
+
+	stage := newStageStore(cfg.StagingDir)
+	require.NoError(t, stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+
+	writer := &recordingReconcileWriter{}
+	follower := newSink(ctx, changefeedID, cfg, writer)
+	follower.SetTableSchemaStore(nil)
+	defer follower.Close(false)
+
+	require.NoError(t, follower.drainStaged(ctx, 10))
+	require.Empty(t, writer.getCalls())
+	require.Empty(t, writer.getReconcileCalls())
+	require.Equal(t, 1, stageFileCount(t, cfg.StagingDir))
+
+	follower.ownerClaimsMu.Lock()
+	leaseCount := len(follower.ownerLeases)
+	follower.ownerClaimsMu.Unlock()
+	require.Zero(t, leaseCount)
+}
+
 func TestSinkSnapshotPropertiesCarryOwnerIdentity(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1814,14 +1895,36 @@ func TestClaimTargetOwnerRevalidatesCachedWarehouseMarker(t *testing.T) {
 	s := newSink(ctx, changefeedID, cfg, &recordingAppendWriter{})
 	identifier := []string{"test", "orders_cdc"}
 
-	require.NoError(t, s.claimTargetOwner(ctx, identifier))
+	require.NoError(t, s.claimTargetOwnerForStage(ctx, identifier))
 	require.NoError(t, icebergcfg.CleanupTargetOwnerClaims(ctx, cfg.Warehouse, s.ownerID))
-	require.NoError(t, s.claimTargetOwner(ctx, identifier))
+	require.NoError(t, s.claimTargetOwnerForStage(ctx, identifier))
 
 	err := icebergcfg.ClaimTargetOwner(ctx, cfg.Warehouse,
 		icebergcfg.NewTargetOwnerClaim("cdc-b", 2002, "default/other", identifier))
 	require.Error(t, err)
 	require.True(t, cerror.Is(err, icebergcfg.ErrTargetOwnerConflict))
+}
+
+func TestStageTargetOwnerSkipsTakeoverReconciliation(t *testing.T) {
+	ctx := context.Background()
+	cfg := newSinkTestConfig(t, 1024)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-stage-no-reconcile")
+	writer := &recordingReconcileWriter{}
+	s := newSink(ctx, changefeedID, cfg, writer)
+	identifier := []string{"test", "orders_cdc"}
+
+	require.NoError(t, s.claimTargetOwnerForStage(ctx, identifier))
+	require.Empty(t, writer.getReconcileCalls())
+
+	ownsLease, err := s.claimTargetOwnerForDrain(ctx, identifier)
+	require.NoError(t, err)
+	require.True(t, ownsLease)
+
+	calls := writer.getReconcileCalls()
+	require.Len(t, calls, 1)
+	require.Equal(t, identifier, calls[0])
 }
 
 func TestClaimTargetOwnerRunsTakeoverReconciliationOnce(t *testing.T) {
@@ -1834,8 +1937,12 @@ func TestClaimTargetOwnerRunsTakeoverReconciliationOnce(t *testing.T) {
 	s := newSink(ctx, changefeedID, cfg, writer)
 	identifier := []string{"test", "orders_cdc"}
 
-	require.NoError(t, s.claimTargetOwner(ctx, identifier))
-	require.NoError(t, s.claimTargetOwner(ctx, identifier))
+	ownsLease, err := s.claimTargetOwnerForDrain(ctx, identifier)
+	require.NoError(t, err)
+	require.True(t, ownsLease)
+	ownsLease, err = s.claimTargetOwnerForDrain(ctx, identifier)
+	require.NoError(t, err)
+	require.True(t, ownsLease)
 
 	calls := writer.getReconcileCalls()
 	require.Len(t, calls, 1)

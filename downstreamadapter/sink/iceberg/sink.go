@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,9 +91,10 @@ type sink struct {
 	writer         appendWriter
 	injectedWriter bool
 
-	ownerClaimsMu sync.Mutex
-	ownerClaims   map[string]struct{}
-	ownerLeases   map[string]*concurrency.Election
+	ownerClaimsMu   sync.Mutex
+	ownerClaims     map[string]struct{}
+	ownerReconciled map[string]struct{}
+	ownerLeases     map[string]*concurrency.Election
 
 	committedRowIDsByIdentifier map[string]*committedRowIDCache
 }
@@ -243,6 +245,7 @@ func newSink(ctx context.Context, changefeedID common.ChangeFeedID, cfg *iceberg
 		writer:                      writer,
 		injectedWriter:              writer != nil,
 		ownerClaims:                 make(map[string]struct{}),
+		ownerReconciled:             make(map[string]struct{}),
 		ownerLeases:                 make(map[string]*concurrency.Election),
 		committedRowIDsByIdentifier: make(map[string]*committedRowIDCache),
 	}
@@ -343,8 +346,12 @@ func (s *sink) applySchemaEvolutionDDL(ddl *commonEvent.DDLEvent) error {
 		ctx = context.Background()
 	}
 	identifier := s.cfg.TargetIdentifier(ddl.TableInfo.GetSchemaName(), ddl.TableInfo.GetTableName())
-	if err := s.claimTargetOwner(ctx, identifier); err != nil {
+	ownsCommitterLease, err := s.claimTargetOwnerForDrain(ctx, identifier)
+	if err != nil {
 		return errors.Trace(err)
+	}
+	if !ownsCommitterLease {
+		return nil
 	}
 	writer, err := s.getWriter(ctx)
 	if err != nil {
@@ -526,8 +533,12 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 	if len(eligible) == 0 {
 		return nil
 	}
-	if err := s.claimTargetOwners(ctx, eligible); err != nil {
+	eligible, err = s.claimTargetOwners(ctx, eligible)
+	if err != nil {
 		return errors.Trace(err)
+	}
+	if len(eligible) == 0 {
+		return nil
 	}
 
 	writer, err := s.getWriter(ctx)
@@ -935,34 +946,64 @@ func (s *sink) markRowsCommitted(
 	return nil
 }
 
-func (s *sink) claimTargetOwners(ctx context.Context, stagedFiles []stagedFile) error {
-	claimed := make(map[string]struct{})
+func (s *sink) claimTargetOwners(ctx context.Context, stagedFiles []stagedFile) ([]stagedFile, error) {
+	claimed := make(map[string]bool)
+	owned := make([]stagedFile, 0, len(stagedFiles))
 	for _, staged := range stagedFiles {
 		key := identifierKey(staged.batch.Identifier)
-		if _, ok := claimed[key]; ok {
-			continue
+		ownsCommitterLease, ok := claimed[key]
+		if !ok {
+			var err error
+			ownsCommitterLease, err = s.claimTargetOwnerForDrain(ctx, staged.batch.Identifier)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			claimed[key] = ownsCommitterLease
 		}
-		if err := s.claimTargetOwner(ctx, staged.batch.Identifier); err != nil {
-			return errors.Trace(err)
+		if ownsCommitterLease {
+			owned = append(owned, staged)
 		}
-		claimed[key] = struct{}{}
 	}
-	return nil
+	return owned, nil
 }
 
-func (s *sink) claimTargetOwner(ctx context.Context, identifier []string) error {
+func (s *sink) claimTargetOwnerForStage(ctx context.Context, identifier []string) error {
+	_, err := s.claimTargetOwner(ctx, identifier, false, false, false)
+	return errors.Trace(err)
+}
+
+func (s *sink) claimTargetOwnerForDrain(ctx context.Context, identifier []string) (bool, error) {
+	return s.claimTargetOwner(ctx, identifier, true, true, true)
+}
+
+func (s *sink) claimTargetOwner(
+	ctx context.Context,
+	identifier []string,
+	claimCommitterLease bool,
+	requireCommitterLease bool,
+	reconcile bool,
+) (bool, error) {
 	key := identifierKey(identifier)
 	s.ownerClaimsMu.Lock()
 	_, alreadyClaimed := s.ownerClaims[key]
+	_, alreadyReconciled := s.ownerReconciled[key]
 	s.ownerClaimsMu.Unlock()
-	if err := s.claimTargetCommitterLease(ctx, identifier); err != nil {
-		s.recordTargetOwnerConflict(err)
-		return errors.Trace(err)
+	ownsCommitterLease := false
+	if claimCommitterLease {
+		var err error
+		ownsCommitterLease, err = s.claimTargetCommitterLease(ctx, identifier)
+		if err != nil {
+			s.recordTargetOwnerConflict(err)
+			return false, errors.Trace(err)
+		}
+	}
+	if requireCommitterLease && !ownsCommitterLease {
+		return false, nil
 	}
 	if err := s.stage.ClaimTargetOwner(ctx, s.changefeedID.String(), identifier); err != nil {
 		s.recordTargetOwnerConflict(err)
 		s.releaseTargetCommitterLease(key)
-		return errors.Trace(err)
+		return false, errors.Trace(err)
 	}
 	claim := icebergcfg.NewTargetOwnerClaim(
 		s.cfg.TiCDCClusterID,
@@ -972,18 +1013,23 @@ func (s *sink) claimTargetOwner(ctx context.Context, identifier []string) error 
 	if err := icebergcfg.ClaimTargetOwnerWithConfig(ctx, s.cfg, claim); err != nil {
 		s.recordTargetOwnerConflict(err)
 		s.releaseTargetCommitterLease(key)
-		return errors.Trace(err)
+		return false, errors.Trace(err)
 	}
-	if !alreadyClaimed {
+	if reconcile && !alreadyReconciled {
 		if err := s.reconcileTargetOnTakeover(ctx, identifier); err != nil {
 			s.releaseTargetCommitterLease(key)
-			return errors.Trace(err)
+			return false, errors.Trace(err)
 		}
+		s.ownerClaimsMu.Lock()
+		s.ownerReconciled[key] = struct{}{}
+		s.ownerClaimsMu.Unlock()
 	}
-	s.ownerClaimsMu.Lock()
-	s.ownerClaims[key] = struct{}{}
-	s.ownerClaimsMu.Unlock()
-	return nil
+	if !alreadyClaimed {
+		s.ownerClaimsMu.Lock()
+		s.ownerClaims[key] = struct{}{}
+		s.ownerClaimsMu.Unlock()
+	}
+	return ownsCommitterLease, nil
 }
 
 func (s *sink) reconcileTargetOnTakeover(ctx context.Context, identifier []string) error {
@@ -1000,14 +1046,14 @@ func (s *sink) reconcileTargetOnTakeover(ctx context.Context, identifier []strin
 	return reconciler.ReconcileTargetOnTakeover(ctx, identifier, s.ownerID, s.changefeedID.String())
 }
 
-func (s *sink) claimTargetCommitterLease(ctx context.Context, identifier []string) error {
+func (s *sink) claimTargetCommitterLease(ctx context.Context, identifier []string) (bool, error) {
 	session, ok := appcontext.GetServiceIfExists[*concurrency.Session](appcontext.EtcdSession)
 	if !ok || session == nil {
-		return nil
+		return true, nil
 	}
 	select {
 	case <-session.Done():
-		return errors.ErrEtcdSessionDone.GenWithStackByArgs()
+		return false, errors.ErrEtcdSessionDone.GenWithStackByArgs()
 	default:
 	}
 
@@ -1015,7 +1061,7 @@ func (s *sink) claimTargetCommitterLease(ctx context.Context, identifier []strin
 	s.ownerClaimsMu.Lock()
 	if election := s.ownerLeases[key]; election != nil {
 		s.ownerClaimsMu.Unlock()
-		return nil
+		return true, nil
 	}
 	s.ownerClaimsMu.Unlock()
 
@@ -1026,13 +1072,17 @@ func (s *sink) claimTargetCommitterLease(ctx context.Context, identifier []strin
 		identifier)
 	payload, err := json.Marshal(&claim)
 	if err != nil {
-		return errors.Trace(err)
+		return false, errors.Trace(err)
 	}
 
 	electionPrefix := etcd.IcebergCommitterElectionKey(s.cfg.TiCDCClusterID, key)
 	election := concurrency.NewElection(session, electionPrefix)
-	if err := s.validateExistingTargetLeader(ctx, election, string(payload)); err != nil {
-		return errors.Trace(err)
+	sameOwner, err := s.validateExistingTargetLeader(ctx, election, string(payload))
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	if sameOwner {
+		return false, nil
 	}
 
 	timeout := time.Duration(config.GetGlobalServerConfig().CaptureSessionTTL+1) * time.Second
@@ -1044,48 +1094,61 @@ func (s *sink) claimTargetCommitterLease(ctx context.Context, identifier []strin
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
-			return errors.Trace(ctx.Err())
+			return false, errors.Trace(ctx.Err())
 		}
-		if leaderErr := s.validateExistingTargetLeader(context.Background(), election, string(payload)); leaderErr != nil {
-			return errors.Trace(leaderErr)
+		sameOwner, leaderErr := s.validateExistingTargetLeader(context.Background(), election, string(payload))
+		if leaderErr != nil {
+			return false, errors.Trace(leaderErr)
 		}
-		return errors.Trace(err)
+		if sameOwner {
+			return false, nil
+		}
+		return false, errors.Trace(err)
 	}
 
 	s.ownerClaimsMu.Lock()
 	defer s.ownerClaimsMu.Unlock()
 	if existing := s.ownerLeases[key]; existing != nil {
 		_ = election.Resign(context.Background())
-		return nil
+		return true, nil
 	}
 	s.ownerLeases[key] = election
 	log.Info("iceberg target committer lease acquired",
 		zap.String("changefeed", s.changefeedID.String()),
 		zap.Strings("identifier", identifier),
 		zap.String("electionPrefix", electionPrefix))
-	return nil
+	return true, nil
 }
 
-func (s *sink) validateExistingTargetLeader(ctx context.Context, election *concurrency.Election, expected string) error {
+func (s *sink) validateExistingTargetLeader(
+	ctx context.Context,
+	election *concurrency.Election,
+	expected string,
+) (bool, error) {
 	resp, err := election.Leader(ctx)
 	if err != nil {
 		if errors.Is(err, concurrency.ErrElectionNoLeader) {
-			return nil
+			return false, nil
 		}
-		return errors.Trace(err)
+		return false, errors.Trace(err)
 	}
 	for _, kv := range resp.Kvs {
 		if string(kv.Value) == expected {
-			return nil
+			return true, nil
 		}
 		var existing icebergcfg.TargetOwnerClaim
 		var expectedClaim icebergcfg.TargetOwnerClaim
-		_ = json.Unmarshal(kv.Value, &existing)
-		_ = json.Unmarshal([]byte(expected), &expectedClaim)
-		return errors.Annotatef(errIcebergTargetOwnerConflict,
+		existingErr := json.Unmarshal(kv.Value, &existing)
+		expectedErr := json.Unmarshal([]byte(expected), &expectedClaim)
+		if existingErr == nil && expectedErr == nil &&
+			existing.OwnerID == expectedClaim.OwnerID &&
+			slices.Equal(existing.Identifier, expectedClaim.Identifier) {
+			return true, nil
+		}
+		return false, errors.Annotatef(errIcebergTargetOwnerConflict,
 			"etcd committer lease owner %q conflicts with owner %q", existing.OwnerID, expectedClaim.OwnerID)
 	}
-	return nil
+	return false, nil
 }
 
 func (s *sink) releaseTargetCommitterLease(key string) {
@@ -1482,7 +1545,7 @@ func (s *sink) stageTable(ctx context.Context, buffers map[string]*tableBuffer, 
 		return nil
 	}
 
-	if err := s.claimTargetOwner(ctx, buffer.identifier); err != nil {
+	if err := s.claimTargetOwnerForStage(ctx, buffer.identifier); err != nil {
 		return errors.Trace(err)
 	}
 	if err := s.stage.Write(ctx, s.changefeedID.String(), buffer.identifier, buffer.rows, buffer.maxCommitTs, buffer.tableInfo); err != nil {

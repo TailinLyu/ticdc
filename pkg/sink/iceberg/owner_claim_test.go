@@ -160,6 +160,22 @@ func TestClaimTargetOwnerAgainstMinIO(t *testing.T) {
 	require.NoError(t, CleanupTargetOwnerClaims(ctx, warehouse, left.OwnerID))
 	require.NoError(t, ClaimTargetOwner(ctx, warehouse, right))
 
+	customCfg := &Config{
+		Warehouse:         warehouse,
+		OwnerMarkerPrefix: "allowed/ticdc-locks",
+	}
+	customLeft := NewTargetOwnerClaim("cdc-minio-left", 1001, "default/minio-left", []string{"minio_db", "orders_custom_cdc"})
+	customRight := NewTargetOwnerClaim("cdc-minio-right", 2002, "default/minio-right", customLeft.Identifier)
+	require.NoError(t, CleanupTargetOwnerClaimsWithConfig(ctx, customCfg, customLeft.OwnerID))
+	require.NoError(t, CleanupTargetOwnerClaimsWithConfig(ctx, customCfg, customRight.OwnerID))
+	require.NoError(t, ClaimTargetOwnerWithConfig(ctx, customCfg, customLeft))
+	err = ClaimTargetOwnerWithConfig(ctx, customCfg, customRight)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrTargetOwnerConflict))
+	require.NoError(t, CleanupTargetOwnerClaimsWithConfig(ctx, customCfg, customLeft.OwnerID))
+	require.NoError(t, ClaimTargetOwnerWithConfig(ctx, customCfg, customRight))
+	require.NoError(t, CleanupTargetOwnerClaimsWithConfig(ctx, customCfg, customRight.OwnerID))
+
 	assertExactlyOneConcurrentOwner(t, ctx, warehouse, []string{"minio_db", "orders_concurrent_cdc"})
 }
 

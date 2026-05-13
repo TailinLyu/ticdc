@@ -109,6 +109,14 @@ wait_feed_normal() {
   return 1
 }
 
+changefeed_checkpoint_tso() {
+  local cf="$1"
+  ${COMPOSE} exec -T ticdc-1 /cdc cli changefeed query \
+    --server=http://127.0.0.1:8300 \
+    --changefeed-id "${cf}" 2>/dev/null |
+    jq -r '.checkpoint_tso // 0'
+}
+
 readback_summary() {
   local namespace="$1"
   local table="$2"
@@ -143,7 +151,18 @@ wait_readback() {
 }
 
 stage_file_count() {
-  find "${WAREHOUSE}/.ticdc-staging" -name '*.json' 2>/dev/null | wc -l | tr -d ' '
+  { find "${WAREHOUSE}/.ticdc-staging" -name '*.json' 2>/dev/null || true; } | wc -l | tr -d ' '
+}
+
+oldest_staged_max_commit_ts() {
+  local ts
+  ts="$(
+    { find "${WAREHOUSE}/.ticdc-staging" -name '*.json' -type f -print0 2>/dev/null || true; } |
+      xargs -0 jq -r '.max_commit_ts // empty' 2>/dev/null |
+      sort -n |
+      head -n 1
+  )"
+  printf '%s\n' "${ts:-0}"
 }
 
 wait_stage_file_count() {
@@ -217,24 +236,45 @@ region_line_count() {
   go run ./local-e2e/tidbexec -query "SHOW TABLE ${db}.${table} REGIONS" | tail -n +2 | wc -l | tr -d ' '
 }
 
-log_services_for() {
+log_services_matching() {
   local since="$1"
-  local cf="$2"
-  local pattern="$3"
-  for service in ticdc-1 ticdc-2 ticdc-3; do
-    docker logs --since="${since}" "ticdc-iceberg-e2e-${service}-1" 2>/dev/null |
-      sed "s/^/${service}-1  | /"
-  done |
-    rg "${pattern}.*${cf}" |
+  local pattern="$2"
+  local matches
+  matches="$(
+    for service in ticdc-1 ticdc-2 ticdc-3; do
+      docker logs --since="${since}" "ticdc-iceberg-e2e-${service}-1" 2>/dev/null |
+        sed "s/^/${service}-1  | /"
+    done |
+      rg "${pattern}" || true
+  )"
+  if [[ -z "${matches}" ]]; then
+    return 0
+  fi
+  printf '%s\n' "${matches}" |
     awk -F'  \\| ' '{print $1}' |
     sort | uniq -c |
     awk '{print $2 "=" $1}' |
     paste -sd, -
 }
 
+log_services_for() {
+  local since="$1"
+  local cf="$2"
+  local pattern="$3"
+  log_services_matching "${since}" "${pattern}.*${cf}"
+}
+
 ensure_stack_healthy() {
   wait_captures 3 90
-  go run ./local-e2e/workload --db ticdc_health_probe --tables t --rows 2 --workers 1 --batch 2 --split-regions 0 --reset >/dev/null
+  local out=""
+  for _ in $(seq 1 60); do
+    if out="$(go run ./local-e2e/workload --db ticdc_health_probe --tables t --rows 2 --workers 1 --batch 2 --split-regions 0 --reset 2>&1)"; then
+      return 0
+    fi
+    sleep 2
+  done
+  printf '%s\n' "${out}" >&2
+  return 1
 }
 
 iceberg_failpoint() {

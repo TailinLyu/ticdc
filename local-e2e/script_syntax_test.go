@@ -33,6 +33,9 @@ func TestLocalE2EScriptsAreParseable(t *testing.T) {
 		"run_s16_minio_owner_marker.sh",
 		"run_s17_schema_unsupported.sh",
 		"run_s20_rolling_restart.sh",
+		"run_s28_lease_drain.sh",
+		"run_s29_owner_marker_prefix.sh",
+		"run_s30_checkpoint_guard.sh",
 	}
 	for _, script := range scripts {
 		t.Run(script, func(t *testing.T) {

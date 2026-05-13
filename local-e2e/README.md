@@ -355,6 +355,9 @@ local-e2e/run_s17_schema_evolution.sh
 local-e2e/run_s17_create_table_unsupported.sh
 local-e2e/run_s17_schema_unsupported.sh
 local-e2e/run_s20_rolling_restart.sh
+local-e2e/run_s28_lease_drain.sh
+local-e2e/run_s29_owner_marker_prefix.sh
+local-e2e/run_s30_checkpoint_guard.sh
 local-e2e/run_m6_soak.sh
 ```
 
