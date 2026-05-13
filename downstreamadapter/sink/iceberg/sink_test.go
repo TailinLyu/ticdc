@@ -386,13 +386,200 @@ func TestDataDispatcherWithEtcdSessionDrainsWhenItOwnsLease(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond)
 	require.False(t, s.isCommitter.Load())
 
-	s.ownerClaimsMu.Lock()
-	leaseCount := len(s.ownerLeases)
-	s.ownerClaimsMu.Unlock()
-	require.Positive(t, leaseCount)
+	require.Eventually(t, func() bool {
+		s.ownerClaimsMu.Lock()
+		defer s.ownerClaimsMu.Unlock()
+		return len(s.ownerLeases) == 0
+	}, 3*time.Second, 10*time.Millisecond)
 
 	cancel()
 	require.NoError(t, <-errCh)
+}
+
+func TestDataDispatcherWithEtcdSessionCampaignsToDrainLocalStagedRows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	setupEtcdCommitterLease(t, ctx, "cdc-a")
+
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-data-dispatcher-campaign"), cfg, writer)
+	defer s.Close(false)
+
+	tableInfo := newPayloadTestTableInfo()
+	tableInfo.TableName = common.TableName{Schema: "test", Table: "orders", TableID: 101}
+	event := newSinkTestInsertEvent(tableInfo, 10, int64(1), "first")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddDMLEvent(event)
+	s.AddCheckpointTs(10)
+
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+	require.False(t, s.isCommitter.Load())
+
+	require.Eventually(t, func() bool {
+		s.ownerClaimsMu.Lock()
+		defer s.ownerClaimsMu.Unlock()
+		return len(s.ownerLeases) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+func TestDataDispatcherWithEtcdSessionCampaignsWithoutCheckpointMessage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	setupEtcdCommitterLease(t, ctx, "cdc-a")
+
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	cfg.CommitInterval = 10 * time.Millisecond
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-data-dispatcher-no-checkpoint"), cfg, writer)
+	defer s.Close(false)
+
+	tableInfo := newPayloadTestTableInfo()
+	tableInfo.TableName = common.TableName{Schema: "test", Table: "orders", TableID: 101}
+	event := newSinkTestInsertEvent(tableInfo, 10, int64(1), "first")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddDMLEvent(event)
+
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+	require.False(t, s.isCommitter.Load())
+	require.Eventually(t, func() bool {
+		s.ownerClaimsMu.Lock()
+		defer s.ownerClaimsMu.Unlock()
+		return len(s.ownerLeases) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+func TestDataDispatcherWithEtcdSessionRetriesWithoutCheckpointAfterTransientFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	setupEtcdCommitterLease(t, ctx, "cdc-a")
+
+	writer := &recordingAppendWriter{err: stderrors.New("catalog unavailable")}
+	cfg := newSinkTestConfig(t, 1)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	cfg.CommitInterval = 10 * time.Millisecond
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-data-dispatcher-no-checkpoint-retry"), cfg, writer)
+	defer s.Close(false)
+
+	tableInfo := newPayloadTestTableInfo()
+	tableInfo.TableName = common.TableName{Schema: "test", Table: "orders", TableID: 101}
+	event := newSinkTestInsertEvent(tableInfo, 10, int64(1), "first")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(ctx)
+	}()
+
+	s.AddDMLEvent(event)
+
+	require.Eventually(t, func() bool {
+		s.ownerClaimsMu.Lock()
+		leaseCount := len(s.ownerLeases)
+		s.ownerClaimsMu.Unlock()
+		return leaseCount == 1 && stageFileCount(t, cfg.StagingDir) == 1
+	}, 3*time.Second, 10*time.Millisecond)
+
+	writer.setErr(nil)
+
+	require.Eventually(t, func() bool {
+		return len(writer.getCalls()) == 1 && stageFileCount(t, cfg.StagingDir) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		s.ownerClaimsMu.Lock()
+		defer s.ownerClaimsMu.Unlock()
+		return len(s.ownerLeases) == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+func TestDataDispatcherWithEtcdSessionDoesNotCampaignWithoutLocalStagedRows(t *testing.T) {
+	ctx := context.Background()
+	setupEtcdCommitterLease(t, ctx, "cdc-a")
+
+	writer := &recordingAppendWriter{}
+	cfg := newSinkTestConfig(t, 1024)
+	cfg.TiCDCClusterID = "cdc-a"
+	cfg.UpstreamID = 1001
+	s := newSink(ctx, common.NewChangefeedID4Test("default", "iceberg-data-dispatcher-idle"), cfg, writer)
+	defer s.Close(false)
+
+	require.NoError(t, s.stageAllAndDrain(ctx, map[string]*tableBuffer{}, 10))
+	require.Empty(t, writer.getCalls())
+
+	s.ownerClaimsMu.Lock()
+	leaseCount := len(s.ownerLeases)
+	s.ownerClaimsMu.Unlock()
+	require.Zero(t, leaseCount)
+}
+
+func TestEtcdCommitterLeaseHandoffBetweenPrivateStagingDrainers(t *testing.T) {
+	ctx := context.Background()
+	setupEtcdCommitterLease(t, ctx, "cdc-a")
+
+	baseCfg := newSinkTestConfig(t, 1024)
+	baseCfg.TiCDCClusterID = "cdc-a"
+	baseCfg.UpstreamID = 1001
+	secondCfg := *baseCfg
+	secondCfg.StagingDir = t.TempDir()
+
+	changefeedID := common.NewChangefeedID4Test("default", "iceberg-private-staging-handoff")
+	identifier := []string{"test", "orders_cdc"}
+	firstWriter := &recordingAppendWriter{}
+	secondWriter := &recordingAppendWriter{}
+	first := newSink(ctx, changefeedID, baseCfg, firstWriter)
+	second := newSink(ctx, changefeedID, &secondCfg, secondWriter)
+	defer first.Close(false)
+	defer second.Close(false)
+
+	require.NoError(t, first.stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(10), "_table_id": int64(101), "data": map[string]any{"id": int64(1)}},
+	}, 10))
+	require.NoError(t, second.stage.Write(ctx, changefeedID.String(), identifier, []map[string]any{
+		{"_op": "I", "_commit_ts": int64(11), "_table_id": int64(101), "data": map[string]any{"id": int64(2)}},
+	}, 11))
+
+	require.NoError(t, first.stageAllAndDrain(ctx, map[string]*tableBuffer{}, 10))
+	require.Len(t, firstWriter.getCalls(), 1)
+	require.Zero(t, stageFileCount(t, baseCfg.StagingDir))
+	first.ownerClaimsMu.Lock()
+	firstLeaseCount := len(first.ownerLeases)
+	first.ownerClaimsMu.Unlock()
+	require.Zero(t, firstLeaseCount)
+
+	require.NoError(t, second.stageAllAndDrain(ctx, map[string]*tableBuffer{}, 11))
+	require.Len(t, secondWriter.getCalls(), 1)
+	require.Zero(t, stageFileCount(t, secondCfg.StagingDir))
+	second.ownerClaimsMu.Lock()
+	secondLeaseCount := len(second.ownerLeases)
+	second.ownerClaimsMu.Unlock()
+	require.Zero(t, secondLeaseCount)
 }
 
 func TestSameOwnerSinkWithoutEtcdLeaseDoesNotDrainStagedRows(t *testing.T) {

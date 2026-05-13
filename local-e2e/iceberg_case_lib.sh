@@ -151,7 +151,20 @@ wait_readback() {
 }
 
 stage_file_count() {
-  { find "${WAREHOUSE}/.ticdc-staging" -name '*.json' 2>/dev/null || true; } | wc -l | tr -d ' '
+  local staging_path="${STAGING_DIR#file://}"
+  if [[ "${STAGING_DIR}" != file://* || "${staging_path}" == "${WAREHOUSE}"* ]]; then
+    { find "${staging_path}" -name '*.json' 2>/dev/null || true; } | wc -l | tr -d ' '
+    return
+  fi
+
+  local total=0
+  local count
+  for service in ticdc-1 ticdc-2 ticdc-3; do
+    count="$(${COMPOSE} exec -T "${service}" /bin/sh -c "find '${staging_path}' -name '*.json' 2>/dev/null | wc -l" 2>/dev/null || printf '0')"
+    count="$(printf '%s' "${count}" | tr -d ' ')"
+    total=$((total + count))
+  done
+  printf '%s\n' "${total}"
 }
 
 oldest_staged_max_commit_ts() {

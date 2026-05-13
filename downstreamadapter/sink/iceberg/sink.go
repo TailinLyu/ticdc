@@ -531,6 +531,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		eligible = append(eligible, staged)
 	}
 	if len(eligible) == 0 {
+		s.releaseTargetCommitterLeasesWithoutEligibleStagedFiles(ctx, checkpointTs)
 		return nil
 	}
 	eligible, err = s.claimTargetOwners(ctx, eligible)
@@ -538,6 +539,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 		return errors.Trace(err)
 	}
 	if len(eligible) == 0 {
+		s.releaseTargetCommitterLeasesWithoutEligibleStagedFiles(ctx, checkpointTs)
 		return nil
 	}
 
@@ -815,6 +817,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			zap.Int("batches", len(group.batchIDs)),
 			zap.Uint64("maxCommitTs", group.maxCommitTs),
 			zap.Uint64("checkpointTs", checkpointTs),
+			zap.Bool("committer", s.isCommitter.Load()),
 			zap.Bool("deleteQueued", deleteQueued))
 	}
 	if len(deleteQueue) > 0 {
@@ -827,6 +830,7 @@ func (s *sink) drainStaged(ctx context.Context, checkpointTs uint64) error {
 			zap.String("changefeed", s.changefeedID.String()),
 			zap.Error(err))
 	}
+	s.releaseTargetCommitterLeasesWithoutEligibleStagedFiles(ctx, checkpointTs)
 	return nil
 }
 
@@ -1161,6 +1165,46 @@ func (s *sink) releaseTargetCommitterLease(key string) {
 	}
 }
 
+func (s *sink) releaseTargetCommitterLeasesWithoutEligibleStagedFiles(ctx context.Context, checkpointTs uint64) {
+	if checkpointTs == 0 {
+		return
+	}
+	stagedFiles, err := s.stage.List(ctx, s.changefeedID.String())
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		log.Warn("failed to inspect iceberg staged files before releasing target committer leases",
+			zap.String("changefeed", s.changefeedID.String()),
+			zap.Uint64("checkpointTs", checkpointTs),
+			zap.Error(err))
+		return
+	}
+	eligibleTargets := make(map[string]struct{})
+	for _, staged := range stagedFiles {
+		if staged.batch.MaxCommitTs <= checkpointTs {
+			eligibleTargets[identifierKey(staged.batch.Identifier)] = struct{}{}
+		}
+	}
+
+	s.ownerClaimsMu.Lock()
+	keys := make([]string, 0, len(s.ownerLeases))
+	for key := range s.ownerLeases {
+		if _, ok := eligibleTargets[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	s.ownerClaimsMu.Unlock()
+
+	for _, key := range keys {
+		s.releaseTargetCommitterLease(key)
+		log.Info("iceberg target committer lease released",
+			zap.String("changefeed", s.changefeedID.String()),
+			zap.String("identifierKey", key),
+			zap.Uint64("checkpointTs", checkpointTs))
+	}
+}
+
 func (s *sink) releaseTargetCommitterLeases() {
 	s.ownerClaimsMu.Lock()
 	leases := make([]*concurrency.Election, 0, len(s.ownerLeases))
@@ -1174,17 +1218,34 @@ func (s *sink) releaseTargetCommitterLeases() {
 	}
 }
 
-func (s *sink) shouldDrainStaged() bool {
+func (s *sink) shouldDrainStaged(ctx context.Context, checkpointTs uint64) (bool, uint64, error) {
 	if s.isCommitter.Load() {
-		return true
+		return true, checkpointTs, nil
 	}
 	session, ok := appcontext.GetServiceIfExists[*concurrency.Session](appcontext.EtcdSession)
 	if !ok || session == nil {
-		return true
+		return true, checkpointTs, nil
 	}
 	s.ownerClaimsMu.Lock()
-	defer s.ownerClaimsMu.Unlock()
-	return len(s.ownerLeases) > 0
+	hasLease := len(s.ownerLeases) > 0
+	s.ownerClaimsMu.Unlock()
+	hasEligible, maxStagedCommitTs, err := s.localStagedFileState(ctx, checkpointTs)
+	if err != nil {
+		return false, checkpointTs, errors.Trace(err)
+	}
+	if hasLease {
+		if hasEligible || maxStagedCommitTs == 0 {
+			return true, checkpointTs, nil
+		}
+		return true, maxStagedCommitTs, nil
+	}
+	if hasEligible {
+		return true, checkpointTs, nil
+	}
+	if maxStagedCommitTs != 0 {
+		return true, maxStagedCommitTs, nil
+	}
+	return false, checkpointTs, nil
 }
 
 func (s *sink) recordStageMetrics(stagedFiles []stagedFile, eligible []stagedFile) {
@@ -1508,9 +1569,13 @@ func (s *sink) stageAllAndDrain(ctx context.Context, buffers map[string]*tableBu
 	if err := s.stageAll(ctx, buffers); err != nil {
 		return errors.Trace(err)
 	}
-	if s.shouldDrainStaged() {
+	shouldDrain, drainCheckpointTs, err := s.shouldDrainStaged(ctx, checkpointTs)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if shouldDrain {
 		failpoint.Inject("IcebergSinkBlockBeforeDrain", nil)
-		if err := s.drainStaged(ctx, checkpointTs); err != nil {
+		if err := s.drainStaged(ctx, drainCheckpointTs); err != nil {
 			return errors.Trace(err)
 		}
 	}
@@ -1527,16 +1592,25 @@ func (s *sink) stageAllAndDrain(ctx context.Context, buffers map[string]*tableBu
 }
 
 func (s *sink) hasEligibleStagedFiles(ctx context.Context, checkpointTs uint64) (bool, error) {
+	hasEligible, _, err := s.localStagedFileState(ctx, checkpointTs)
+	return hasEligible, errors.Trace(err)
+}
+
+func (s *sink) localStagedFileState(ctx context.Context, checkpointTs uint64) (bool, uint64, error) {
 	stagedFiles, err := s.stage.List(ctx, s.changefeedID.String())
 	if err != nil {
-		return false, errors.Trace(err)
+		return false, 0, errors.Trace(err)
 	}
+	var maxStagedCommitTs uint64
 	for _, staged := range stagedFiles {
+		if staged.batch.MaxCommitTs > maxStagedCommitTs {
+			maxStagedCommitTs = staged.batch.MaxCommitTs
+		}
 		if staged.batch.MaxCommitTs <= checkpointTs {
-			return true, nil
+			return true, maxStagedCommitTs, nil
 		}
 	}
-	return false, nil
+	return false, maxStagedCommitTs, nil
 }
 
 func (s *sink) stageTable(ctx context.Context, buffers map[string]*tableBuffer, key string) error {
