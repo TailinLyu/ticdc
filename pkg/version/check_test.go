@@ -287,6 +287,24 @@ func TestReleaseSemver(t *testing.T) {
 	}
 }
 
+func TestFailpointBuildInfoUsesBuildVariable(t *testing.T) {
+	oldFailpointBuild := FailpointBuild
+	defer func() {
+		FailpointBuild = oldFailpointBuild
+	}()
+
+	FailpointBuild = "true"
+	require.True(t, IsFailpointBuild())
+	require.Contains(t, GetRawInfo(), "Failpoint Build: true\n")
+
+	FailpointBuild = "1"
+	require.True(t, IsFailpointBuild())
+
+	FailpointBuild = "false"
+	require.False(t, IsFailpointBuild())
+	require.Contains(t, GetRawInfo(), "Failpoint Build: false\n")
+}
+
 func TestGetTiCDCClusterVersion(t *testing.T) {
 	t.Parallel()
 	testCases := []struct {

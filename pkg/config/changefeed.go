@@ -181,6 +181,7 @@ func (t AdminJobType) IsStopState() bool {
 
 type ChangefeedConfig struct {
 	ChangefeedID common.ChangeFeedID `json:"changefeed_id"`
+	UpstreamID   uint64              `json:"upstream_id"`
 	StartTS      uint64              `json:"start_ts"`
 	TargetTS     uint64              `json:"target_ts"`
 	SinkURI      string              `json:"sink_uri"`
@@ -263,6 +264,7 @@ type ChangeFeedInfo struct {
 func (info *ChangeFeedInfo) ToChangefeedConfig() *ChangefeedConfig {
 	return &ChangefeedConfig{
 		ChangefeedID:           info.ChangefeedID,
+		UpstreamID:             info.UpstreamID,
 		StartTS:                info.StartTs,
 		TargetTS:               info.TargetTs,
 		SinkURI:                info.SinkURI,

@@ -15,6 +15,7 @@ package httputil
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net/http"
 	"net/url"
@@ -40,7 +41,11 @@ func NewClient(credential *security.Credential) (*Client, error) {
 		}
 		if tlsConf != nil {
 			httpTrans := http.DefaultTransport.(*http.Transport).Clone()
+			tlsConf = tlsConf.Clone()
+			// TiCDC's muxed listener uses h2 for gRPC and HTTP/1.1 for REST.
+			tlsConf.NextProtos = []string{"http/1.1"}
 			httpTrans.TLSClientConfig = tlsConf
+			httpTrans.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 			transport = httpTrans
 		}
 	}

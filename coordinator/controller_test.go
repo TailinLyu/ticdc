@@ -63,6 +63,26 @@ func TestResumeChangefeed(t *testing.T) {
 	require.Equal(t, config.StateNormal, changefeedDB.GetByID(cfID).GetInfo().State)
 }
 
+type neverFinishedStopOperator struct{}
+
+func (neverFinishedStopOperator) IsFinished() bool {
+	return false
+}
+
+func TestWaitStopChangefeedOperatorHonorsContext(t *testing.T) {
+	oldInterval := stopChangefeedPollInterval
+	stopChangefeedPollInterval = time.Millisecond
+	defer func() {
+		stopChangefeedPollInterval = oldInterval
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := waitStopChangefeedOperator(ctx, common.NewChangeFeedIDWithName("stuck", common.DefaultKeyspaceName), neverFinishedStopOperator{})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestResumeChangefeedNormalState(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	backend := mock_changefeed.NewMockBackend(ctrl)

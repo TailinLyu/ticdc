@@ -50,6 +50,32 @@ const (
 	createChangefeedRetryInterval = 5 * time.Second
 )
 
+var stopChangefeedPollInterval = time.Second
+
+type stopChangefeedOperatorStatus interface {
+	IsFinished() bool
+}
+
+func waitStopChangefeedOperator(ctx context.Context, id common.ChangeFeedID, op stopChangefeedOperatorStatus) error {
+	ticker := time.NewTicker(stopChangefeedPollInterval)
+	defer ticker.Stop()
+
+	count := 0
+	for {
+		if op.IsFinished() {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			count += 1
+			log.Info("wait for stop changefeed operator finished", zap.Int("count", count), zap.Any("id", id))
+		}
+	}
+}
+
 // Controller schedules and balance changefeeds, there are 3 main components:
 //  1. scheduler: generate operators for handling different scheduling tasks.
 //  2. operatorController: manage all operators and execute them periodically.
@@ -644,6 +670,9 @@ func (c *Controller) RemoveChangefeed(ctx context.Context, id common.ChangeFeedI
 		c.apiLock.Unlock()
 		return 0, errors.New("changefeed not found")
 	}
+	info := cf.GetInfo()
+	sinkURI := info.SinkURI
+	upstreamID := info.UpstreamID
 	err := c.backend.SetChangefeedProgress(ctx, id, config.ProgressRemoving)
 	if err != nil {
 		c.apiLock.Unlock()
@@ -652,16 +681,10 @@ func (c *Controller) RemoveChangefeed(ctx context.Context, id common.ChangeFeedI
 	op := c.operatorController.StopChangefeed(ctx, id, true)
 	c.apiLock.Unlock()
 
-	count := 0
-	for {
-		if op.IsFinished() {
-			break
-		}
-
-		time.Sleep(1 * time.Second)
-		count += 1
-		log.Info("wait for stop changefeed operator finished", zap.Int("count", count), zap.Any("id", id))
+	if err := waitStopChangefeedOperator(ctx, id, op); err != nil {
+		return 0, errors.Trace(err)
 	}
+	cleanupRemovedChangefeedSinkArtifacts(id, sinkURI, upstreamID)
 	return cf.GetStatus().CheckpointTs, nil
 }
 
@@ -688,15 +711,8 @@ func (c *Controller) PauseChangefeed(ctx context.Context, id common.ChangeFeedID
 	op := c.operatorController.StopChangefeed(ctx, id, false)
 	c.apiLock.Unlock()
 
-	count := 0
-	for {
-		if op.IsFinished() {
-			break
-		}
-
-		time.Sleep(1 * time.Second)
-		count += 1
-		log.Info("wait for stop changefeed operator finished", zap.Int("count", count), zap.Any("id", id))
+	if err := waitStopChangefeedOperator(ctx, id, op); err != nil {
+		return errors.Trace(err)
 	}
 	return nil
 }

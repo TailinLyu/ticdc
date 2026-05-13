@@ -1,0 +1,142 @@
+# Iceberg Resilience E2E Results
+
+Environment:
+
+- Date: 2026-05-09
+- TiCDC branch: `iceberg-e2e-v8.5.7`
+- TiCDC image: `local/ticdc-iceberg:e2e`
+- TiDB/PD/TiKV images: `v8.5.6`
+- Iceberg REST: `tabulario/iceberg-rest:latest`
+- Query engines: PrestoDB `0.297`, Spark Iceberg `tabulario/spark-iceberg:latest`
+- Querybook: local service at `http://127.0.0.1:10001/local_iceberg/`; local user `codex`; environment `local_iceberg`; engine `local_presto_iceberg` using `presto://presto:8080/iceberg`. Querybook API-launched `SELECT 1 AS ok` completed via Presto with result `[["ok"],["1"]]`; final Querybook readback against `ice_s21.orders_cdc` completed with `D=400,I=6000,U=600`.
+
+Result format:
+
+| ID | Scenario | Status | Evidence | Notes |
+| --- | --- | --- | --- | --- |
+| S01 | Committer hard-killed during active writes | PASS | Killed `ticdc-1`; workload expected `I=2000,U=200,D=133`; Iceberg readback `rows=2333 inserts=2000 updates=200 deletes=133`; writer staging logs across `ticdc-1/ticdc-2/ticdc-3 = 10/35/35`; staged JSON count `0`. | Demonstrates multi-writer, single-committer recovery for ordinary committer process death. |
+| S02 | Committer killed after writers staged files but before drain | PASS | Paused active committer `ticdc-2` at `IcebergSinkBlockBeforeDrain`; observed `28` staged JSON files; killed/restarted `ticdc-2`; Iceberg readback `rows=1166 inserts=1000 updates=100 deletes=66`. | Replacement committer drained staged files exactly once in this pre-append crash window. |
+| S03 | Committer exits after Iceberg append but before staged-file delete | FAIL | Injected `IcebergSinkExitAfterAppendBeforeStageDelete` on `ticdc-2`; workload expected `rows=350 inserts=300 updates=30 deletes=20`; Iceberg readback stabilized at `rows=370 inserts=320 updates=30 deletes=20`. | Duplicate replay bug: a staged batch can be committed to Iceberg, survive on disk, and be appended again by the replacement committer. |
+| S04 | Non-committer writer hard-killed during active writes | PASS | Killed non-committer `ticdc-1` while `ticdc-2` was committer; workload expected `I=5000,U=500,D=333`; Iceberg readback `rows=5833 inserts=5000 updates=500 deletes=333`. | Demonstrates replay correctness for writer death before durable staging/ack. |
+| S05 | Non-committer exits after staging but before `PostFlush` | FAIL | Injected `IcebergSinkExitAfterStageBeforePostFlush` on non-committer `ticdc-2`; workload expected `rows=350 inserts=300 updates=30 deletes=20`; after catch-up, Iceberg readback stabilized at `rows=370 inserts=320 updates=30 deletes=20`. | Duplicate replay bug: durable staged file plus unacked upstream event can both be committed. |
+| S06 | Graceful committer restart during active writes | PASS | Restarted committer `ticdc-3`; workload expected `rows=1166 inserts=1000 updates=100 deletes=66`; Iceberg readback matched exactly. | Graceful committer handoff/restart works for normal crash window. |
+| S07 | All non-committer writers killed while committer survives | PASS | With `ticdc-1` as committer, killed `ticdc-2` and `ticdc-3`; workload expected `rows=1166 inserts=1000 updates=100 deletes=66`; Iceberg readback matched exactly. | Writer failover works when the single committer remains up. |
+| S08 | All TiCDC nodes killed then restarted | PASS | Killed `ticdc-1,ticdc-2,ticdc-3` during writes; restarted all; workload expected `rows=1166 inserts=1000 updates=100 deletes=66`; Iceberg readback matched exactly. | Full TiCDC outage catches up from checkpoint. |
+| S09 | Iceberg REST outage while staged files exist, then recovery | PARTIAL | During REST outage, committer logged repeated `lookup iceberg-rest ... no such host` and staged files remained (`30` observed). REST restart alone did not drain; after restarting TiCDC, Iceberg readback matched `rows=583 inserts=500 updates=50 deletes=33`. | Data was not lost, but automatic recovery after catalog DNS outage did not happen until TiCDC restarted. |
+| S10 | Staging path write failure, then path repaired | PASS | Made staging path a regular file; changefeed entered warning with `stat ... not a directory`; after replacing it with a directory, same changefeed recovered and Iceberg readback matched `rows=116 inserts=100 updates=10 deletes=6`. | Retry works for staging write failure once the filesystem condition is repaired. |
+| S11 | Staged-file delete failure after successful append | FAIL | Injected `IcebergSinkErrorAfterAppendBeforeStageDelete`; workload expected `rows=116 inserts=100 updates=10 deletes=6`; Iceberg readback stabilized at `rows=126 inserts=110 updates=10 deletes=6`. | Same idempotency gap as S03: successful append plus retained staged file duplicates one batch. |
+| S12 | High-volume staged-batch drain | FAIL | Workload emitted `I=10000,U=1000,D=666` with `max_rows_per_client_ms=310`; expected `rows=11666`. Iceberg readback stalled at `rows=7253 inserts=6782 updates=284 deletes=187`; staged files reached `782`; changefeed stayed `warning` with `UncheckedSQLException: Unknown failure`; Iceberg REST logged SQLite catalog lock errors during the run and all TiCDC nodes later exited with `ErrCaptureSuicide` during PD/etcd stalls. | Under high local commit pressure, the `tabulario/iceberg-rest` SQLite/JDBC catalog became the bottleneck and TiCDC did not drain the staged backlog automatically. S12 staging subtree was removed after recording the failure so later scenarios start clean. |
+| S13 | Multiple source tables in one changefeed | PASS | One changefeed captured `orders`, `customers`, and `products`; each source table had `9` TiDB regions; each Iceberg table read back `rows=350 inserts=300 updates=30 deletes=20`; Presto readback for `orders_cdc` returned `D=20,I=300,U=30`; changefeed was `normal`; staged JSON count `0`. | Writer staging occurred on `ticdc-1`, `ticdc-2`, and `ticdc-3`; only `ticdc-1` logged `iceberg committer enabled` and `iceberg committer appended staged rows`. |
+| S14 | Two changefeeds writing different Iceberg target tables | PASS | Changefeeds `s14-orders` and `s14-customers`; source tables `ice_s14.orders` and `ice_s14.customers` each had `4` TiDB regions; Iceberg readback `orders_cf1 rows=233 inserts=200 updates=20 deletes=13` and `customers_cf2 rows=233 inserts=200 updates=20 deletes=13`; staged JSON count `0`. | `orders` writer staging was distributed across `ticdc-1/ticdc-2/ticdc-3 = 5/2/3`, committer append history `ticdc-1=10`; `customers` writer staging was distributed across `ticdc-1/ticdc-2/ticdc-3 = 2/2/4`, committer append history `ticdc-3=8`. Historical `committer enabled` logs showed `s14-customers` moved from `ticdc-2` to `ticdc-3`; appends for the run were single-node. |
+| S15 | Two changefeeds writing the same Iceberg target table | UNSUPPORTED / REJECTED | Fresh rebuilt-image run after target-owner guard: changefeeds `s15-owner-left-1778379359` and `s15-owner-right-1778379359` both captured one source table into `orders_shared`; Iceberg readback stayed exact at `rows=116 inserts=100 updates=10 deletes=6`; one changefeed entered `warning`, the other stayed `normal`; conflict logs `5`; Prometheus owner-conflict metric `1`; staged files during the run `7`; staged files after remove `0`; warehouse owner markers after remove `0`. | Same-target writes are now explicitly banned. The first owner records a marker under `.ticdc/iceberg-target-owners` in the shared warehouse; a second owner is rejected before append, including across clusters sharing the same file/S3 warehouse. |
+| S16 | Split, merge, and move table scheduling while writing | PARTIAL | Changefeed `s16-move`; source table `ice_s16.orders` had `4` TiDB regions; workload emitted `rows=700 inserts=600 updates=60 deletes=40` with slowed batches; Iceberg readback matched exactly; staged JSON count `0`; writer staging was distributed across `ticdc-1/ticdc-2/ticdc-3 = 8/14/8`; committer append history `ticdc-2=30`. | `split-table-by-region-count` succeeded and `merge-table` succeeded while writes were active. `move-split-table` returned `ErrOperatorIsNil`; after repeated merges reduced the table to one replication, `move-table` to `ticdc-1` succeeded and counts remained exact. |
+| S17 | DDL behavior: add/drop column, rename table, truncate table | PASS_WITH_SEMANTIC_LIMITS | Schema run `s17-schema`: after `ADD COLUMN extra` and `DROP COLUMN note`, Iceberg readback was `rows=50 inserts=50 updates=0 deletes=0`; staged JSON count `0`; changefeed `normal`. Rename/truncate run `s17-rename`: old target `orders_cdc` stayed `rows=20 inserts=20`; renamed target `orders_renamed_cdc` read back `rows=15 inserts=15`; staged JSON count `0`; changefeed `normal`. | Counts remain correct, but Iceberg schema is not evolved: the added `extra` column was not present in the existing Iceberg `data` struct, and the dropped `note` column remained as nullable `note=null` for later rows. Rename maps to a new Iceberg target table name; truncate is captured as append-log continuation and does not remove old Iceberg rows. |
+| S18 | Out-of-order commit timestamps across spans | PASS | Changefeed `s18-order`; source table `ice_s18.orders` had `8` TiDB regions; workload emitted `rows=466 inserts=400 updates=40 deletes=26`; Iceberg readback matched exactly; staged JSON count `0`; physical Iceberg scan order had `17` commit-ts inversions across `17` distinct commit timestamps. | Writer staging was distributed across `ticdc-1/ticdc-2/ticdc-3 = 5/7/7`; committer append history `ticdc-1=19`. This confirms the sink behaves as an append log and does not require globally monotonic physical output order. |
+| S19 | Duplicate detection/idempotency under replay | FAIL | Covered by deterministic replay windows S03, S05, and S11. S03 duplicate after committer exit post-append read back `rows=370` instead of `350`; S05 duplicate after writer exit post-stage read back `rows=370` instead of `350`; S11 staged-file delete failure read back `rows=126` instead of `116`. | There is no committed-batch idempotency marker or staged-file exactly-once delete/append protocol today, so replay can duplicate rows in Iceberg. |
+| S20 | Long-running rolling TiCDC hard-restart loop | FAIL | Changefeed `s20-restarts`; killed/restarted `ticdc-1`, `ticdc-2`, `ticdc-3`, `ticdc-2`, `ticdc-1`, `ticdc-3` while a slowed workload emitted `rows=2333 inserts=2000 updates=200 deletes=133`; final changefeed state `normal`; staged JSON count `0`; Iceberg readback was `rows=3110 inserts=2667 updates=266 deletes=177`. | This reproduces replay duplication without deterministic failpoints. Writer staging was distributed across `ticdc-1/ticdc-2/ticdc-3 = 29/29/58`; committer append history after restarts was `ticdc-1=116`, with historical committer enablement on `ticdc-1` and `ticdc-2`. |
+| S21 | High-concurrency workload with many rows per millisecond | PASS | Changefeed `s21-highcon`; source table `ice_s21.orders` had `6` TiDB regions; workload emitted `rows=7000 inserts=6000 updates=600 deletes=400`; workload reported `max_rows_per_client_ms=700`; Iceberg readback matched exactly; staged JSON count `0`. | Writer staging was evenly distributed across `ticdc-1/ticdc-2/ticdc-3 = 24/24/24`; single committer append history `ticdc-2=72`. This smaller lean-stack high-concurrency pass complements S12, where a larger run saturated the local Iceberg REST SQLite catalog. |
+| S22 | 1:1 mapping: one source table to one Iceberg table | PASS | Changefeed `s22-one-to-one`; source table `ice_s22.orders` had `4` TiDB regions; Iceberg target `orders_cdc` read back `rows=350 inserts=300 updates=30 deletes=20`; staged JSON count `0`. | Writer staging was distributed across `ticdc-1/ticdc-2/ticdc-3 = 6/3/3`; single committer append history `ticdc-2=12`. |
+| S23 | 1:many mapping: one source table to multiple Iceberg tables | PASS | Changefeeds `s23-left` and `s23-right` both captured `ice_s23.orders` with different suffixes; source table had `4` TiDB regions; targets `orders_left` and `orders_right` each read back `rows=233 inserts=200 updates=20 deletes=13`; staged JSON count `0`. | Each target had its own changefeed-scoped committer: `s23-left` appended on `ticdc-2=8`, `s23-right` appended on `ticdc-1=8`; writer staging was distributed across all three nodes for both feeds. |
+| S24 | many:1 mapping: multiple sources/changefeeds targeting one Iceberg table | UNSUPPORTED / CONFIG_LIMITATION | The representable many-changefeed-to-one-target case is now rejected by the S15 target-owner guard. Multiple different source table names still cannot be mapped to one Iceberg table through configuration because `TargetIdentifier` is fixed as `{database-prefix + source schema, source table + table-suffix}`. | Supporting true many-source-table-to-one-target requires a target identifier override or routing expression plus a cross-changefeed/target-table commit protocol. Until that exists, the shape is intentionally unsupported. |
+| S25 | many:many mapping: multiple source tables and multiple changefeeds to multiple Iceberg tables | PASS | Changefeeds `s25-a` and `s25-b` both captured `ice_s25.orders` and `ice_s25.customers` with distinct suffixes; both source tables had `4` TiDB regions; targets `orders_a`, `customers_a`, `orders_b`, and `customers_b` each read back `rows=175 inserts=150 updates=15 deletes=10`; staged JSON count `0`. | Writer staging was distributed across all three nodes for both changefeeds; append history was single-committer per changefeed (`s25-a` on `ticdc-1=16`, `s25-b` on `ticdc-2=14`). |
+| S26 | Node-by-node active-committer hard-kill matrix | PASS | Forced each TiCDC node to become the active committer in separate runs, then hard-killed it during inserts. `ticdc-1`: `s26-1-hard-8`, target `orders_cdc rows=600 inserts=600`, `probe_cdc rows=20 inserts=20`, staged `0`, replacement appender `ticdc-3=23`. `ticdc-2`: `s26-2-hardb-1`, target `orders_cdc rows=600 inserts=600`, staged `0`, `replaced_before_restart=1`, replacement appender `ticdc-1=23`. `ticdc-3`: `s26-3-hardb-5`, target `orders_cdc rows=600 inserts=600`, `probe_cdc rows=20 inserts=20`, staged `0`, `replaced_before_restart=1`, replacement appender `ticdc-2=22`. | Confirms the committer role is updated after active-committer process death, staged files drain through the replacement committer, and Iceberg target counts stay exact for ordinary staged-file recovery windows. During this work the helper was fixed so creating a feed through `ticdc-2`/`ticdc-3` uses the container-local API port `8300`. |
+| S27 | Node-by-node span writer failover matrix | PASS / COVERED | Covered by S04 and S07 plus the multi-span distribution checks in S13, S14, S21, and S25. S04 killed non-committer writer `ticdc-1` during active writes and read back exact `rows=5833 inserts=5000 updates=500 deletes=333`. S07 killed non-committer writers `ticdc-2` and `ticdc-3` while the committer survived and read back exact `rows=1166 inserts=1000 updates=100 deletes=66`. | Writer failover is correct when the committer survives. Duplicate risk belongs to the durable-stage/replay boundary and is tracked by S03, S05, S11, and S20. |
+| S28 | Per-table/per-changefeed committer ownership in multi-changefeed setup | PASS / COVERED | Covered by S14 and S25. S14 ran two changefeeds to distinct Iceberg targets: `orders_cf1 rows=233 inserts=200 updates=20 deletes=13` with appender `ticdc-1=10`, and `customers_cf2 rows=233 inserts=200 updates=20 deletes=13` with appender `ticdc-3=8`. S25 ran two changefeeds over two source tables and four target tables; all targets read back exact `rows=175 inserts=150 updates=15 deletes=10`; append history was single-committer per changefeed (`s25-a` on `ticdc-1=16`, `s25-b` on `ticdc-2=14`). | Distinct target tables avoid cross-changefeed drain. The unsafe same-target case is now rejected by S15's warehouse target-owner marker. |
+
+Final verification:
+
+- `go test ./downstreamadapter/sink/iceberg ./pkg/sink/iceberg ./pkg/metrics ./local-e2e/workload ./local-e2e/icebergread ./local-e2e/tidbexec -count=1` passed.
+- MinIO owner-marker coverage passed:
+  `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778378985`.
+- PrestoDB readback for `ice_s21.orders_cdc`: `D=400,I=6000,U=600`.
+- Spark SQL readback for `rest.ice_s21.orders_cdc`: `D=400,I=6000,U=600`.
+- Querybook API readback through `local_presto_iceberg`: `D=400,I=6000,U=600`.
+- Final local TiCDC state: three captures up, no active changefeeds, staged JSON count `0`.
+
+## 2026-05-10 Fresh Idempotency And Hardening Rerun
+
+These rows were rerun after the staged-row idempotency changes that make row IDs
+stable across replayed keyed rows even when TiCDC omits raw `RowKey` bytes.
+
+| ID | Scenario | Status | Fresh evidence | Notes |
+| --- | --- | --- | --- | --- |
+| S03 | Committer exits after Iceberg append but before staged-file delete | PASS | `S03_REPLAY_PASS cf=s03-replay-1778406697 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s03_append_exit_replay.sh`. A smaller rerun exposed a six-row duplicate when target ownership was claimed after staging; the final pass verifies the claim now happens before the stage file is visible. The latest code also adds shared-staging committed-batch and committed-row ledgers plus Bolt-backed row-hash shard indexes, so retained or replayed stage files are not deduped only by Iceberg snapshot summaries or whole-batch IDs. |
+| S05 | Non-committer exits after staging but before `PostFlush` | PASS | `S05_REPLAY_PASS cf=s05-replay-1778406656 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s05_stage_exit_replay.sh`. This rerun used the durable committed row-ID ledger and row-index path for delayed source replay after a staged file can be cleaned up. |
+| S09 | Iceberg REST outage while staged files exist, then recovery | PASS | `S09_CATALOG_RECOVERY_PASS cf=s09-catalog-1778388259 summary=rows=583 inserts=500 updates=50 deletes=33 staged_during=19 staged_after=0 staged_after_remove=0` | REST was stopped, staged files accumulated, REST was restarted, and TiCDC drained without a TiCDC restart. |
+| S11 | Staged-file delete failure after successful append | PASS | `S11_REPLAY_PASS cf=s11-replay-1778388072 summary=rows=116 inserts=100 updates=10 deletes=6 staged_after=0 staged_after_remove=0` | Repeatable command: `local-e2e/run_s11_append_error_replay.sh`. |
+| S12 | High-volume staged-batch drain | PASS | `S12_DRAIN_PASS cf=s12-drain-1778388306 summary=rows=11666 inserts=10000 updates=1000 deletes=666 staged_after=0 staged_after_remove=0` | Reran at the prior high-volume size; local REST catalog drained fully. |
+| S15 | Two changefeeds writing the same Iceberg target table | UNSUPPORTED / REJECTED | `S15_OWNER_PASS cf_left=s15-owner-left-1778391469 cf_right=s15-owner-right-1778391469 summary=rows=70 inserts=60 updates=6 deletes=4 left_state=normal right_state=warning conflicts=9 metric_conflicts=3 staged_during=0 staged_after_remove=0 owner_markers_after_remove=0` | Same-target writes remain intentionally banned by the shared warehouse target-owner marker. The losing writer now fails before exposing staged rows. |
+| S16 | S3-compatible target-owner marker | PASS | `S16_MINIO_OWNER_PASS bucket=ticdc-iceberg-owner prefix=s16-owner-marker-1778388358` | Verifies the cross-cluster owner fence works through the S3/MinIO external storage path. |
+| S17 | Iceberg schema evolution DDL and live CREATE TABLE DDL | PARTIAL / POSITIVE SCHEMA EVOLUTION | New harness `run_s17_schema_evolution.sh` covers safe ADD, RENAME, and conservative DROP column evolution with Iceberg schema readback. Focused unit coverage verifies supported DDL dispatch, metadata-only index DDL, and unsafe type-narrowing rejection. `run_s17_schema_unsupported.sh` and `run_s17_create_table_unsupported.sh` now cover TRUNCATE and live CREATE rejection. | TiCDC applies Iceberg schema transactions for safe column changes. DROP retains nullable Iceberg fields for historical rows. Live table lifecycle DDL remains rejected until the target-level DDL protocol is production-ready. |
+| S19 | Duplicate detection/idempotency under replay | PASS / COVERED | Covered by fresh S03, S05, and S11 passes. | The duplicate replay windows now have repeatable local scripts. |
+| S20 | Long-running rolling TiCDC hard-restart loop | PASS | `S20_ROLLING_PASS cf=s20-restarts-1778391546 summary=rows=700 inserts=600 updates=60 deletes=40 staged_after=0 staged_after_remove=0` | Rolling restart duplicate inserts were fixed by stable keyed-row fallback IDs. |
+
+## 2026-05-10 Durable Ledger And Observability Follow-Up
+
+The reviewer-identified snapshot-expiration risk is now covered by a local unit
+regression: a batch marked in the shared-staging `.committed` ledger is skipped
+even when the Iceberg writer reports no committed batch IDs from snapshot
+history. Another regression verifies the ledger marker is written before the
+staged JSON file is deleted after append.
+
+The same loop added Iceberg sink metric coverage for staged bytes, staging
+backend info, committed rows, durable batch and row ledger entry counts, ledger
+writes, and ledger lookups. This does not replace the need for S3/native
+staging soak; it documents and enforces the current PVC/shared-filesystem JSON
+staging boundary. The shared staging filesystem must provide POSIX file fsync,
+directory fsync, atomic rename, and Bolt-compatible mmap/flock semantics;
+generic NFS/RWX/object-fuse mounts are unsupported unless they explicitly
+provide those semantics.
+The follow-up review loop changed replay lookup to exact candidate batch-marker
+checks, so retained historical `.commit` files are not walked on the commit
+path; corrupt or unrelated retained marker files do not affect unrelated staged
+batches. The latest review loop also makes staged JSON publication durable with
+file fsync, close, rename, and parent-directory fsync before source progress can
+be acknowledged, and bounds Iceberg snapshot-summary dedupe to the current
+candidate staged batch IDs. A rebuilt-image S03 rerun then exposed a
+partial-overlap duplicate where a later staged batch had a different batch ID
+but repeated rows from an earlier drain; that is now covered by deferred
+staged-file cleanup, retained committed staged evidence while later files exist
+for the target, durable handled markers for duplicate-only replay batches, and
+a focused restart regression. A subsequent reviewer delayed-replay regression
+then showed the later overlapping batch can arrive after earlier staged evidence
+was already cleaned up; the committer now writes sharded durable committed
+row-ID segments plus Bolt-backed exact row-hash shard indexes before cleanup
+and probes only current candidate row-index shards on replay, so all-new replay
+misses do not decode retained row segments. Missing or dirty shard indexes are
+rebuilt from retained segment evidence before lookup returns; dirty markers are
+cleared only after the dirty shard set has been repaired. New commits add only
+new row hashes to touched shard DBs instead of rewriting cumulative JSON
+indexes. Segment-only ledgers from older local builds are reconciled into row
+indexes on first lookup.
+
+Fresh local e2e reruns after the ledger and metrics patch:
+
+- `S03_REPLAY_PASS cf=s03-replay-1778406697 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+- `S05_REPLAY_PASS cf=s05-replay-1778406656 summary=rows=140 inserts=120 updates=12 deletes=8 staged_after=0 staged_after_remove=0`
+- Earlier Prometheus scrape after S05 included
+  `ticdc_sink_iceberg_commit_duration_seconds`,
+  `ticdc_sink_iceberg_committed_batches_total`,
+  `ticdc_sink_iceberg_committed_rows_total`,
+  `ticdc_sink_iceberg_committed_ledger_lookups_total`, and
+  `ticdc_sink_iceberg_committed_ledger_writes_total`.
+- Shared staging cleanup after changefeed removal had `0` staged JSON files,
+  `0` committed ledger marker files, and `0` target-owner marker files.
+
+## 2026-05-10 TiCDC Big-Feature Review Closure
+
+The latest review loop added target committer leases in TiCDC etcd, takeover
+orphan reconciliation, safe Iceberg column schema evolution, rich TiDB-to-Iceberg
+type mapping, REST catalog transport knobs, negative lag accounting, and
+commit-conflict retry coverage.
+
+Fresh focused evidence added by this loop:
+
+- `TestClaimTargetOwnerPublishesEtcdCommitterLease`
+- `TestClaimTargetOwnerRunsTakeoverReconciliationOnce`
+- `TestClaimTargetOwnerRevalidatesCachedWarehouseMarker`
+- `TestCanPromoteIcebergTypeRejectsNarrowingDDL`
+- `TestWriteBlockEventAppliesSupportedColumnDDL`
+- `TestWriteBlockEventTreatsIndexDDLAsMetadataOnly`
+- `run_s17_schema_evolution.sh`
+- `run_m6_soak.sh`

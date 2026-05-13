@@ -105,6 +105,10 @@ LDFLAGS += -X "$(TIFLOW_CDC_PKG)/pkg/version.GitHash=$(GITHASH)"
 LDFLAGS += -X "$(TIFLOW_CDC_PKG)/pkg/version.GitBranch=$(GITBRANCH)"
 LDFLAGS += -X "$(TIFLOW_CDC_PKG)/pkg/version.BuildTS=$(BUILDTS)"
 
+FAILPOINT_LDFLAGS := $(LDFLAGS)
+FAILPOINT_LDFLAGS += -X "$(CDC_PKG)/pkg/version.FailpointBuild=true"
+FAILPOINT_LDFLAGS += -X "$(TIFLOW_CDC_PKG)/pkg/version.FailpointBuild=true"
+
 CONSUMER_BUILD_FLAG=
 ifeq ("${IS_ALPINE}", "1")
 	CONSUMER_BUILD_FLAG = -tags musl
@@ -150,7 +154,7 @@ generate_mock: tools/bin/mockgen
 build-cdc-with-failpoint: check_failpoint_ctl
 build-cdc-with-failpoint: ## Build cdc with failpoint enabled.
 	$(FAILPOINT_ENABLE)
-	$(GOBUILD) -ldflags '$(LDFLAGS)' -o bin/cdc ./cmd/cdc/main.go
+	$(GOBUILD) -ldflags '$(FAILPOINT_LDFLAGS)' -o bin/cdc ./cmd/cdc/main.go
 	$(FAILPOINT_DISABLE)
 
 cdc:

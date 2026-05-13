@@ -84,6 +84,162 @@ var (
 		}, []string{getKeyspaceLabel(), "changefeed", "event_type"})
 )
 
+// ---------- Metrics for Iceberg sink. ---------- //
+var (
+	IcebergStagedFilesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_staged_files",
+			Help:      "Number of staged Iceberg files for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed", "state"})
+
+	IcebergStagedRowsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_staged_rows",
+			Help:      "Number of rows in staged Iceberg files for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed", "state"})
+
+	IcebergStagedOldestAgeGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_staged_oldest_age_seconds",
+			Help:      "Age in seconds of the oldest staged Iceberg batch for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed", "state"})
+
+	IcebergStagedBytesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_staged_bytes",
+			Help:      "Total bytes in staged Iceberg JSON batch files for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed", "state"})
+
+	IcebergCommitDurationHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_commit_duration_seconds",
+			Help:      "Bucketed histogram of Iceberg append commit duration.",
+			Buckets:   prometheus.ExponentialBuckets(0.005, 2, 18),
+		}, []string{getKeyspaceLabel(), "changefeed", "result"})
+
+	IcebergCommittedBatchesCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_batches_total",
+			Help:      "Total count of staged Iceberg batches committed.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
+	IcebergCommittedRowsCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_rows_total",
+			Help:      "Total count of staged Iceberg rows committed.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
+	IcebergCommitBarrierLagGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_commit_barrier_lag_tso",
+			Help:      "Difference between the current commit barrier TSO and the max commit TSO in the latest committed Iceberg batch.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
+	IcebergNegativeCommitBarrierLagCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_negative_commit_barrier_lag_total",
+			Help:      "Total count of Iceberg commits whose max commit TSO is greater than the observed commit barrier TSO.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
+	IcebergCommittedLedgerEntriesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_ledger_entries",
+			Help:      "Number of durable committed-batch ledger entries written by this TiCDC process for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
+	IcebergCommittedLedgerWritesCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_ledger_writes_total",
+			Help:      "Total count of durable committed-batch ledger write attempts.",
+		}, []string{getKeyspaceLabel(), "changefeed", "result"})
+
+	IcebergCommittedLedgerLookupsCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_ledger_lookups_total",
+			Help:      "Total count of durable committed-batch ledger lookup attempts.",
+		}, []string{getKeyspaceLabel(), "changefeed", "result"})
+
+	IcebergCommittedRowLedgerEntriesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_row_ledger_entries",
+			Help:      "Number of durable committed row-ID ledger entries written by this TiCDC process for a changefeed.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+
+	IcebergCommittedRowLedgerWritesCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_row_ledger_writes_total",
+			Help:      "Total count of durable committed row-ID ledger write attempts.",
+		}, []string{getKeyspaceLabel(), "changefeed", "result"})
+
+	IcebergCommittedRowLedgerLookupsCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_committed_row_ledger_lookups_total",
+			Help:      "Total count of durable committed row-ID ledger lookup attempts.",
+		}, []string{getKeyspaceLabel(), "changefeed", "result"})
+
+	IcebergAppendFailureCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_append_failures_total",
+			Help:      "Total count of Iceberg append or retry-path failures.",
+		}, []string{getKeyspaceLabel(), "changefeed", "reason"})
+
+	IcebergCleanupFailureCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_cleanup_failures_total",
+			Help:      "Total count of Iceberg staged-file or owner-marker cleanup failures.",
+		}, []string{getKeyspaceLabel(), "changefeed", "reason"})
+
+	IcebergStagingBackendInfoGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_staging_backend_info",
+			Help:      "Info gauge for the Iceberg staging backend in use.",
+		}, []string{getKeyspaceLabel(), "changefeed", "backend"})
+
+	IcebergTargetOwnerConflictCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "ticdc",
+			Subsystem: "sink",
+			Name:      "iceberg_target_owner_conflicts_total",
+			Help:      "Total count of unsupported Iceberg target owner conflicts.",
+		}, []string{getKeyspaceLabel(), "changefeed"})
+)
+
 // ---------- Metrics for txn sink and backends. ---------- //
 var (
 	// ConflictDetectDuration records the duration of detecting conflict.
@@ -234,6 +390,26 @@ func initSinkMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(ExecDMLEventCounter)
 	registry.MustRegister(ExecDMLEventRowsAffectedCounter)
 	registry.MustRegister(ExecutionErrorCounter)
+
+	registry.MustRegister(IcebergStagedFilesGauge)
+	registry.MustRegister(IcebergStagedRowsGauge)
+	registry.MustRegister(IcebergStagedOldestAgeGauge)
+	registry.MustRegister(IcebergStagedBytesGauge)
+	registry.MustRegister(IcebergCommitDurationHistogram)
+	registry.MustRegister(IcebergCommittedBatchesCounter)
+	registry.MustRegister(IcebergCommittedRowsCounter)
+	registry.MustRegister(IcebergCommitBarrierLagGauge)
+	registry.MustRegister(IcebergNegativeCommitBarrierLagCounter)
+	registry.MustRegister(IcebergCommittedLedgerEntriesGauge)
+	registry.MustRegister(IcebergCommittedLedgerWritesCounter)
+	registry.MustRegister(IcebergCommittedLedgerLookupsCounter)
+	registry.MustRegister(IcebergCommittedRowLedgerEntriesGauge)
+	registry.MustRegister(IcebergCommittedRowLedgerWritesCounter)
+	registry.MustRegister(IcebergCommittedRowLedgerLookupsCounter)
+	registry.MustRegister(IcebergAppendFailureCounter)
+	registry.MustRegister(IcebergCleanupFailureCounter)
+	registry.MustRegister(IcebergStagingBackendInfoGauge)
+	registry.MustRegister(IcebergTargetOwnerConflictCounter)
 
 	registry.MustRegister(ConflictDetectDuration)
 	registry.MustRegister(QueueDuration)

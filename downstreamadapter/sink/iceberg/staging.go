@@ -1,0 +1,1274 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package iceberg
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+
+	"github.com/pingcap/ticdc/pkg/common"
+	"github.com/pingcap/ticdc/pkg/errors"
+	icebergcfg "github.com/pingcap/ticdc/pkg/sink/iceberg"
+	bolt "go.etcd.io/bbolt"
+)
+
+type stagedBatch struct {
+	Changefeed  string             `json:"changefeed"`
+	BatchID     string             `json:"batch_id"`
+	Identifier  []string           `json:"identifier"`
+	TableSchema *stagedTableSchema `json:"table_schema,omitempty"`
+	Rows        []map[string]any   `json:"rows"`
+	RowIDs      []string           `json:"row_ids,omitempty"`
+	MaxCommitTs uint64             `json:"max_commit_ts"`
+	CreatedAt   time.Time          `json:"created_at"`
+}
+
+type stagedFile struct {
+	path      string
+	sizeBytes int64
+	batch     stagedBatch
+}
+
+type targetOwnerRecord struct {
+	Changefeed string    `json:"changefeed"`
+	Identifier []string  `json:"identifier"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type committedBatchRecord struct {
+	Changefeed  string    `json:"changefeed"`
+	BatchID     string    `json:"batch_id"`
+	Identifier  []string  `json:"identifier"`
+	MaxCommitTs uint64    `json:"max_commit_ts"`
+	RowCount    int       `json:"row_count"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type committedRowSegmentRecord struct {
+	Changefeed  string    `json:"changefeed"`
+	Identifier  []string  `json:"identifier"`
+	BatchIDs    []string  `json:"batch_ids"`
+	Bucket      string    `json:"bucket"`
+	RowIDs      []string  `json:"row_ids"`
+	MaxCommitTs uint64    `json:"max_commit_ts"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type committedRowIndexDirtyRecord struct {
+	Changefeed string    `json:"changefeed"`
+	Identifier []string  `json:"identifier"`
+	Shards     []string  `json:"shards"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type stageStore struct {
+	root string
+}
+
+var syncFileForAtomicWrite = func(file *os.File) error {
+	return file.Sync()
+}
+
+var syncDirForAtomicWrite = syncDirectory
+
+func newStageStore(root string) *stageStore {
+	return &stageStore{root: root}
+}
+
+func (s *stageStore) Write(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	rows []map[string]any,
+	maxCommitTs uint64,
+	tableInfo ...*common.TableInfo,
+) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if s.root == "" {
+		return errors.New("iceberg staging dir is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Trace(err)
+	}
+
+	dir := filepath.Join(s.root, pathSegment(changefeed), pathSegment(identifierKey(identifier)))
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
+		return errors.Trace(err)
+	}
+
+	stagedRows, rowIDs, err := prepareStagedRows(identifier, rows)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	batchID, err := stagedBatchID(identifier, stagedRows, rowIDs, maxCommitTs)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	finalName := filepath.Join(dir, fmt.Sprintf("%020d-%s.json", maxCommitTs, batchID))
+	if _, err := os.Stat(finalName); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return errors.Trace(err)
+	}
+
+	batch := stagedBatch{
+		Changefeed:  changefeed,
+		BatchID:     batchID,
+		Identifier:  append([]string(nil), identifier...),
+		TableSchema: firstStagedTableSchema(tableInfo),
+		Rows:        stagedRows,
+		RowIDs:      rowIDs,
+		MaxCommitTs: maxCommitTs,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := writeJSONFileAtomically(dir, ".stage-*.tmp", finalName, &batch); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func firstStagedTableSchema(tableInfo []*common.TableInfo) *stagedTableSchema {
+	if len(tableInfo) == 0 {
+		return nil
+	}
+	return stagedTableSchemaForTableInfo(tableInfo[0])
+}
+
+func (s *stageStore) List(ctx context.Context, changefeed string) ([]stagedFile, error) {
+	if s.root == "" {
+		return nil, errors.New("iceberg staging dir is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	root := filepath.Join(s.root, pathSegment(changefeed))
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errors.Trace(err)
+	}
+
+	var files []stagedFile
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d != nil && d.IsDir() && (d.Name() == ".committed" || d.Name() == ".committed-rows" || d.Name() == ".committed-row-index") {
+			return filepath.SkipDir
+		}
+		if d == nil || d.IsDir() || filepath.Ext(path) != ".json" {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		batch, err := readStagedBatch(path)
+		if err != nil {
+			return err
+		}
+		files = append(files, stagedFile{path: path, sizeBytes: info.Size(), batch: batch})
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].batch.MaxCommitTs != files[j].batch.MaxCommitTs {
+			return files[i].batch.MaxCommitTs < files[j].batch.MaxCommitTs
+		}
+		return files[i].path < files[j].path
+	})
+	return files, nil
+}
+
+func (s *stageStore) MarkBatchesCommitted(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	batchIDs []string,
+	maxCommitTs uint64,
+	rowCount int,
+) (int, error) {
+	if len(batchIDs) == 0 {
+		return 0, nil
+	}
+	if s.root == "" {
+		return 0, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return 0, errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return 0, errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	dir := committedBatchLedgerDir(s.root, changefeed, identifier)
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
+		return 0, errors.Trace(err)
+	}
+	created := 0
+	for _, batchID := range batchIDs {
+		if batchID == "" {
+			return 0, errors.New("iceberg committed ledger batch id is empty")
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, errors.Trace(err)
+		}
+		finalName := committedBatchLedgerPath(s.root, changefeed, identifier, batchID)
+		if _, err := os.Stat(finalName); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return 0, errors.Trace(err)
+		}
+
+		record := committedBatchRecord{
+			Changefeed:  changefeed,
+			BatchID:     batchID,
+			Identifier:  append([]string(nil), identifier...),
+			MaxCommitTs: maxCommitTs,
+			RowCount:    rowCount,
+			CreatedAt:   time.Now().UTC(),
+		}
+		if err := writeCommittedBatchRecord(dir, finalName, record); err != nil {
+			return 0, errors.Trace(err)
+		}
+		created++
+	}
+	return created, nil
+}
+
+func (s *stageStore) CommittedBatchesForCandidates(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	batchIDs []string,
+) (map[string]struct{}, error) {
+	if s.root == "" {
+		return nil, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return nil, errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return nil, errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	committed := make(map[string]struct{}, len(batchIDs))
+	for _, batchID := range batchIDs {
+		if batchID == "" {
+			return nil, errors.New("iceberg committed ledger batch id is empty")
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Trace(err)
+		}
+		path := committedBatchLedgerPath(s.root, changefeed, identifier, batchID)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, errors.Trace(err)
+		}
+		record, err := readCommittedBatchRecord(path)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if record.BatchID != batchID {
+			return nil, errors.Errorf("iceberg committed ledger batch id mismatch: path=%s record=%s", batchID, record.BatchID)
+		}
+		committed[batchID] = struct{}{}
+	}
+	return committed, nil
+}
+
+func (s *stageStore) MarkRowsCommitted(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	rowIDs []string,
+	batchIDs []string,
+	maxCommitTs uint64,
+) (int, error) {
+	if len(rowIDs) == 0 {
+		return 0, nil
+	}
+	if s.root == "" {
+		return 0, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return 0, errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return 0, errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	uniqueRowIDs := make([]string, 0, len(rowIDs))
+	seenRows := make(map[string]struct{}, len(rowIDs))
+	for _, rowID := range rowIDs {
+		if rowID == "" {
+			return 0, errors.New("iceberg committed row id is empty")
+		}
+		if _, ok := seenRows[rowID]; ok {
+			continue
+		}
+		seenRows[rowID] = struct{}{}
+		uniqueRowIDs = append(uniqueRowIDs, rowID)
+	}
+
+	committedRows, err := s.CommittedRowIDsForCandidates(ctx, changefeed, identifier, uniqueRowIDs)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	newRowsByBucket := make(map[string][]string)
+	newHashesByShard := make(map[string]map[string]struct{})
+	for _, rowID := range uniqueRowIDs {
+		if _, ok := committedRows[rowID]; ok {
+			continue
+		}
+		rowHash := committedRowHash(rowID)
+		bucket := committedRowLedgerBucketFromHash(rowHash)
+		newRowsByBucket[bucket] = append(newRowsByBucket[bucket], rowID)
+		shard := committedRowIndexShardFromHash(rowHash)
+		hashes := newHashesByShard[shard]
+		if hashes == nil {
+			hashes = make(map[string]struct{})
+			newHashesByShard[shard] = hashes
+		}
+		hashes[rowHash] = struct{}{}
+	}
+	if len(newRowsByBucket) == 0 {
+		return 0, nil
+	}
+
+	createdRows := 0
+	createdAt := time.Now().UTC()
+	if err := s.markCommittedRowIndexDirty(changefeed, identifier, newHashesByShard, createdAt); err != nil {
+		return 0, errors.Trace(err)
+	}
+	for bucket, bucketRowIDs := range newRowsByBucket {
+		if err := ctx.Err(); err != nil {
+			return 0, errors.Trace(err)
+		}
+		sort.Strings(bucketRowIDs)
+		finalName := committedRowSegmentLedgerPath(s.root, changefeed, identifier, bucket, batchIDs, maxCommitTs)
+		dir := filepath.Dir(finalName)
+		if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
+			return 0, errors.Trace(err)
+		}
+		if _, err := os.Stat(finalName); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return 0, errors.Trace(err)
+		}
+
+		record := committedRowSegmentRecord{
+			Changefeed:  changefeed,
+			Identifier:  append([]string(nil), identifier...),
+			BatchIDs:    sortedStringsCopy(batchIDs),
+			Bucket:      bucket,
+			RowIDs:      append([]string(nil), bucketRowIDs...),
+			MaxCommitTs: maxCommitTs,
+			CreatedAt:   createdAt,
+		}
+		if err := writeCommittedRowSegmentRecord(dir, finalName, record); err != nil {
+			return 0, errors.Trace(err)
+		}
+		createdRows += len(bucketRowIDs)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, errors.Trace(err)
+	}
+	if err := s.writeCommittedRowIndexes(changefeed, identifier, newHashesByShard); err != nil {
+		return 0, errors.Trace(err)
+	}
+	if err := s.clearCommittedRowIndexDirty(changefeed, identifier); err != nil {
+		return 0, errors.Trace(err)
+	}
+	return createdRows, nil
+}
+
+func (s *stageStore) CommittedRowIDsForCandidates(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	rowIDs []string,
+) (map[string]struct{}, error) {
+	if s.root == "" {
+		return nil, errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return nil, errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return nil, errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	committed := make(map[string]struct{}, len(rowIDs))
+	neededByShard := make(map[string]map[string]string)
+	for _, rowID := range rowIDs {
+		if rowID == "" {
+			return nil, errors.New("iceberg committed row id is empty")
+		}
+		shard := committedRowIndexShard(rowID)
+		needed := neededByShard[shard]
+		if needed == nil {
+			needed = make(map[string]string)
+			neededByShard[shard] = needed
+		}
+		needed[committedRowHash(rowID)] = rowID
+	}
+
+	for shard, needed := range neededByShard {
+		if err := s.ensureCommittedRowIndexShard(ctx, changefeed, identifier, shard); err != nil {
+			return nil, errors.Trace(err)
+		}
+		committedRows, err := s.committedRowHashesForCandidates(changefeed, identifier, shard, needed)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		for _, rowID := range committedRows {
+			if _, ok := needed[committedRowHash(rowID)]; ok {
+				committed[rowID] = struct{}{}
+			}
+		}
+	}
+	return committed, nil
+}
+
+func (s *stageStore) ensureCommittedRowIndexShard(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	shard string,
+) error {
+	if _, err := os.Stat(committedRowIndexDirtyPath(s.root, changefeed, identifier)); err == nil {
+		return errors.Trace(s.repairDirtyCommittedRowIndexes(ctx, changefeed, identifier, shard))
+	} else if !os.IsNotExist(err) {
+		return errors.Trace(err)
+	}
+	exists, err := s.committedRowIndexShardExists(changefeed, identifier, shard)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if exists {
+		return nil
+	}
+	return errors.Trace(s.rebuildCommittedRowIndexShard(ctx, changefeed, identifier, shard))
+}
+
+func (s *stageStore) repairDirtyCommittedRowIndexes(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	requestedShard string,
+) error {
+	record, err := readCommittedRowIndexDirtyRecord(committedRowIndexDirtyPath(s.root, changefeed, identifier))
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if record.Changefeed != changefeed {
+		return errors.Errorf("iceberg committed row index dirty changefeed mismatch: path=%s record=%s", changefeed, record.Changefeed)
+	}
+	if !stringSlicesEqual(record.Identifier, identifier) {
+		return errors.Errorf("iceberg committed row index dirty identifier mismatch: path=%v record=%v", identifier, record.Identifier)
+	}
+
+	shards := make(map[string]struct{}, len(record.Shards)+1)
+	for _, shard := range record.Shards {
+		if shard == "" {
+			return errors.New("iceberg committed row index dirty shard is empty")
+		}
+		shards[shard] = struct{}{}
+	}
+	if requestedShard != "" {
+		shards[requestedShard] = struct{}{}
+	}
+	for _, shard := range sortedMapKeys(shards) {
+		if err := ctx.Err(); err != nil {
+			return errors.Trace(err)
+		}
+		if err := s.rebuildCommittedRowIndexShard(ctx, changefeed, identifier, shard); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return errors.Trace(s.clearCommittedRowIndexDirty(changefeed, identifier))
+}
+
+func (s *stageStore) committedRowIndexShardExists(changefeed string, identifier []string, shard string) (bool, error) {
+	path := committedRowIndexPath(s.root, changefeed, identifier)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, errors.Trace(err)
+	}
+	db, err := openCommittedRowIndexDB(path)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	defer db.Close()
+
+	exists := false
+	err = db.View(func(tx *bolt.Tx) error {
+		exists = tx.Bucket([]byte(shard)) != nil
+		return nil
+	})
+	return exists, errors.Trace(err)
+}
+
+func (s *stageStore) committedRowHashesForCandidates(
+	changefeed string,
+	identifier []string,
+	shard string,
+	needed map[string]string,
+) ([]string, error) {
+	path := committedRowIndexPath(s.root, changefeed, identifier)
+	db, err := openCommittedRowIndexDB(path)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	defer db.Close()
+
+	committed := make([]string, 0, len(needed))
+	err = db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(shard))
+		if bucket == nil {
+			return nil
+		}
+		for rowHash, rowID := range needed {
+			if bucket.Get([]byte(rowHash)) != nil {
+				committed = append(committed, rowID)
+			}
+		}
+		return nil
+	})
+	return committed, errors.Trace(err)
+}
+
+func (s *stageStore) writeCommittedRowIndexes(
+	changefeed string,
+	identifier []string,
+	rowHashesByShard map[string]map[string]struct{},
+) error {
+	path := committedRowIndexPath(s.root, changefeed, identifier)
+	db, err := openCommittedRowIndexDB(path)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	updateErr := db.Update(func(tx *bolt.Tx) error {
+		for shard, rowHashes := range rowHashesByShard {
+			bucket, err := tx.CreateBucketIfNotExists([]byte(shard))
+			if err != nil {
+				return errors.Trace(err)
+			}
+			for rowHash := range rowHashes {
+				if rowHash == "" {
+					return errors.New("iceberg committed row index hash is empty")
+				}
+				if err := bucket.Put([]byte(rowHash), []byte{}); err != nil {
+					return errors.Trace(err)
+				}
+			}
+		}
+		return nil
+	})
+	closeErr := db.Close()
+	if updateErr != nil {
+		return errors.Trace(updateErr)
+	}
+	if closeErr != nil {
+		return errors.Trace(closeErr)
+	}
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func (s *stageStore) rebuildCommittedRowIndexShard(
+	ctx context.Context,
+	changefeed string,
+	identifier []string,
+	shard string,
+) error {
+	if shard == "" {
+		return errors.New("iceberg committed row index shard is empty")
+	}
+	root := committedRowSegmentLedgerDir(s.root, changefeed, identifier, committedRowLedgerBucketFromHash(shard))
+	if _, err := os.Stat(root); err != nil {
+		if !os.IsNotExist(err) {
+			return errors.Trace(err)
+		}
+	}
+
+	rowHashes := make(map[string]struct{})
+	if _, err := os.Stat(root); err == nil {
+		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return errors.Trace(err)
+			}
+			if err := ctx.Err(); err != nil {
+				return errors.Trace(err)
+			}
+			if d == nil || d.IsDir() || filepath.Ext(path) != ".rows" {
+				return nil
+			}
+			bucket := filepath.Base(filepath.Dir(path))
+			record, err := readCommittedRowSegmentRecord(path)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			if record.Bucket != bucket {
+				return errors.Errorf("iceberg committed row ledger bucket mismatch: path=%s record=%s", bucket, record.Bucket)
+			}
+			for _, rowID := range record.RowIDs {
+				if rowID == "" {
+					return errors.New("iceberg committed row id is empty")
+				}
+				rowHash := committedRowHash(rowID)
+				if committedRowIndexShardFromHash(rowHash) == shard {
+					rowHashes[rowHash] = struct{}{}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	if err := s.writeCommittedRowIndexes(changefeed, identifier, map[string]map[string]struct{}{shard: rowHashes}); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func (s *stageStore) markCommittedRowIndexDirty(
+	changefeed string,
+	identifier []string,
+	rowHashesByShard map[string]map[string]struct{},
+	updatedAt time.Time,
+) error {
+	finalName := committedRowIndexDirtyPath(s.root, changefeed, identifier)
+	dir := filepath.Dir(finalName)
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
+		return errors.Trace(err)
+	}
+	shards := make([]string, 0, len(rowHashesByShard))
+	for shard := range rowHashesByShard {
+		shards = append(shards, shard)
+	}
+	record := committedRowIndexDirtyRecord{
+		Changefeed: changefeed,
+		Identifier: append([]string(nil), identifier...),
+		Shards:     sortedStringsCopy(shards),
+		UpdatedAt:  updatedAt,
+	}
+	return writeCommittedRowIndexDirtyRecord(dir, finalName, record)
+}
+
+func (s *stageStore) clearCommittedRowIndexDirty(changefeed string, identifier []string) error {
+	path := committedRowIndexDirtyPath(s.root, changefeed, identifier)
+	dir := filepath.Dir(path)
+	if err := os.Remove(path); err != nil {
+		if !os.IsNotExist(err) {
+			return errors.Trace(err)
+		}
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			return nil
+		} else if statErr != nil {
+			return errors.Trace(statErr)
+		}
+	}
+	if err := syncDirectory(dir); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func (s *stageStore) Delete(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func (s *stageStore) ClaimTargetOwner(ctx context.Context, changefeed string, identifier []string) error {
+	if s.root == "" {
+		return errors.New("iceberg staging dir is empty")
+	}
+	if changefeed == "" {
+		return errors.New("iceberg changefeed is empty")
+	}
+	if len(identifier) == 0 {
+		return errors.New("iceberg target identifier is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Trace(err)
+	}
+
+	dir := filepath.Join(s.root, ".owners")
+	if err := mkdirAllAndSyncParents(dir, 0o755); err != nil {
+		return errors.Trace(err)
+	}
+	path := filepath.Join(dir, pathSegment(identifierKey(identifier))+".owner")
+
+	for {
+		record, err := readTargetOwnerRecord(path)
+		if err == nil {
+			if record.Changefeed == changefeed {
+				return nil
+			}
+			return errors.Annotatef(errIcebergTargetOwnerConflict,
+				"owner %q conflicts with changefeed %q", record.Changefeed, changefeed)
+		}
+		if !os.IsNotExist(err) {
+			return errors.Trace(err)
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Trace(err)
+		}
+
+		record = targetOwnerRecord{
+			Changefeed: changefeed,
+			Identifier: append([]string(nil), identifier...),
+			CreatedAt:  time.Now().UTC(),
+		}
+		payload, err := json.Marshal(&record)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		payload = append(payload, '\n')
+
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if _, err := file.Write(payload); err != nil {
+			_ = file.Close()
+			_ = os.Remove(path)
+			return errors.Trace(err)
+		}
+		if err := file.Close(); err != nil {
+			_ = os.Remove(path)
+			return errors.Trace(err)
+		}
+		return nil
+	}
+}
+
+func (s *stageStore) DeleteChangefeed(changefeed string) error {
+	return icebergcfg.CleanupChangefeedStaging(s.root, changefeed)
+}
+
+func readTargetOwnerRecord(path string) (targetOwnerRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return targetOwnerRecord{}, err
+	}
+	defer file.Close()
+
+	var record targetOwnerRecord
+	if err := json.NewDecoder(file).Decode(&record); err != nil {
+		return targetOwnerRecord{}, err
+	}
+	if record.Changefeed == "" {
+		return targetOwnerRecord{}, errors.New("iceberg target owner changefeed is empty")
+	}
+	return record, nil
+}
+
+func readStagedBatch(path string) (stagedBatch, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return stagedBatch{}, errors.Trace(err)
+	}
+	defer file.Close()
+
+	var batch stagedBatch
+	decoder := json.NewDecoder(file)
+	decoder.UseNumber()
+	if err := decoder.Decode(&batch); err != nil {
+		return stagedBatch{}, errors.Trace(err)
+	}
+	return batch, nil
+}
+
+func readCommittedBatchRecord(path string) (committedBatchRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return committedBatchRecord{}, errors.Trace(err)
+	}
+	defer file.Close()
+
+	var record committedBatchRecord
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&record); err != nil {
+		return committedBatchRecord{}, errors.Trace(err)
+	}
+	if record.BatchID == "" {
+		return committedBatchRecord{}, errors.New("iceberg committed ledger batch id is empty")
+	}
+	return record, nil
+}
+
+func readCommittedRowSegmentRecord(path string) (committedRowSegmentRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return committedRowSegmentRecord{}, errors.Trace(err)
+	}
+	defer file.Close()
+
+	var record committedRowSegmentRecord
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&record); err != nil {
+		return committedRowSegmentRecord{}, errors.Trace(err)
+	}
+	if record.Bucket == "" {
+		return committedRowSegmentRecord{}, errors.New("iceberg committed row ledger bucket is empty")
+	}
+	if len(record.RowIDs) == 0 {
+		return committedRowSegmentRecord{}, errors.New("iceberg committed row segment is empty")
+	}
+	return record, nil
+}
+
+func readCommittedRowIndexDirtyRecord(path string) (committedRowIndexDirtyRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return committedRowIndexDirtyRecord{}, errors.Trace(err)
+	}
+	defer file.Close()
+
+	var record committedRowIndexDirtyRecord
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&record); err != nil {
+		return committedRowIndexDirtyRecord{}, errors.Trace(err)
+	}
+	if record.Changefeed == "" {
+		return committedRowIndexDirtyRecord{}, errors.New("iceberg committed row index dirty changefeed is empty")
+	}
+	if len(record.Identifier) == 0 {
+		return committedRowIndexDirtyRecord{}, errors.New("iceberg committed row index dirty identifier is empty")
+	}
+	if len(record.Shards) == 0 {
+		return committedRowIndexDirtyRecord{}, errors.New("iceberg committed row index dirty shard list is empty")
+	}
+	return record, nil
+}
+
+func writeCommittedBatchRecord(dir string, finalName string, record committedBatchRecord) error {
+	return writeJSONFileAtomically(dir, ".ledger-*.tmp", finalName, &record)
+}
+
+func writeCommittedRowSegmentRecord(dir string, finalName string, record committedRowSegmentRecord) error {
+	return writeJSONFileAtomically(dir, ".row-ledger-*.tmp", finalName, &record)
+}
+
+func writeCommittedRowIndexDirtyRecord(dir string, finalName string, record committedRowIndexDirtyRecord) error {
+	return writeJSONFileAtomically(dir, ".row-index-dirty-*.tmp", finalName, &record)
+}
+
+func writeJSONFileAtomically(dir string, tmpPattern string, finalName string, value any) error {
+	tmp, err := os.CreateTemp(dir, tmpPattern)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	encoder := json.NewEncoder(tmp)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		_ = tmp.Close()
+		return errors.Trace(err)
+	}
+	if err := syncFileForAtomicWrite(tmp); err != nil {
+		_ = tmp.Close()
+		return errors.Trace(err)
+	}
+	if err := tmp.Close(); err != nil {
+		return errors.Trace(err)
+	}
+	if err := os.Rename(tmpName, finalName); err != nil {
+		return errors.Trace(err)
+	}
+	cleanup = false
+	if err := syncDirForAtomicWrite(dir); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func mkdirAllAndSyncParents(path string, perm os.FileMode) error {
+	cleanPath := filepath.Clean(path)
+	info, err := os.Stat(cleanPath)
+	if err == nil {
+		if !info.IsDir() {
+			return errors.Errorf("%s is not a directory", cleanPath)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return errors.Trace(err)
+	}
+
+	parent := filepath.Dir(cleanPath)
+	if parent != cleanPath {
+		if err := mkdirAllAndSyncParents(parent, perm); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	if err := os.Mkdir(cleanPath, perm); err != nil {
+		if !os.IsExist(err) {
+			return errors.Trace(err)
+		}
+		info, statErr := os.Stat(cleanPath)
+		if statErr != nil {
+			return errors.Trace(statErr)
+		}
+		if !info.IsDir() {
+			return errors.Errorf("%s is not a directory", cleanPath)
+		}
+		return nil
+	}
+	if parent != cleanPath {
+		return errors.Trace(syncDirForAtomicWrite(parent))
+	}
+	return nil
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func openCommittedRowIndexDB(path string) (*bolt.DB, error) {
+	if err := mkdirAllAndSyncParents(filepath.Dir(path), 0o755); err != nil {
+		return nil, errors.Trace(err)
+	}
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return db, nil
+}
+
+const (
+	stagingRowIDField             = "_ticdc_iceberg_row_id"
+	committedRowLedgerBucketCount = 16
+	committedRowIndexShardCount   = 256
+)
+
+func prepareStagedRows(identifier []string, rows []map[string]any) ([]map[string]any, []string, error) {
+	stagedRows := make([]map[string]any, 0, len(rows))
+	rowIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		stagedRow, rowID, err := prepareStagedRow(identifier, row)
+		if err != nil {
+			return nil, nil, errors.Trace(err)
+		}
+		stagedRows = append(stagedRows, stagedRow)
+		rowIDs = append(rowIDs, rowID)
+	}
+	return stagedRows, rowIDs, nil
+}
+
+func prepareStagedRow(identifier []string, row map[string]any) (map[string]any, string, error) {
+	var rowID string
+	if value, ok := row[stagingRowIDField]; ok {
+		var isString bool
+		rowID, isString = value.(string)
+		if !isString || rowID == "" {
+			return nil, "", errors.Errorf("invalid iceberg staging row id %v", value)
+		}
+	}
+
+	stagedRow := make(map[string]any, len(row))
+	for key, value := range row {
+		if key == stagingRowIDField {
+			continue
+		}
+		stagedRow[key] = value
+	}
+	if rowID == "" {
+		var err error
+		rowID, err = stagedRowID(identifier, stagedRow)
+		if err != nil {
+			return nil, "", errors.Trace(err)
+		}
+	}
+	return stagedRow, rowID, nil
+}
+
+func stagedRowIDs(identifier []string, rows []map[string]any, rowIDs []string) ([]string, error) {
+	if len(rowIDs) > 0 {
+		if len(rowIDs) != len(rows) {
+			return nil, errors.Errorf("iceberg staged row id count %d does not match row count %d",
+				len(rowIDs), len(rows))
+		}
+		copied := make([]string, 0, len(rowIDs))
+		for _, rowID := range rowIDs {
+			if rowID == "" {
+				return nil, errors.New("iceberg staged row id is empty")
+			}
+			copied = append(copied, rowID)
+		}
+		return copied, nil
+	}
+
+	computed := make([]string, 0, len(rows))
+	for _, row := range rows {
+		rowID, err := stagedRowID(identifier, row)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		computed = append(computed, rowID)
+	}
+	return computed, nil
+}
+
+func pathSegment(value string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func committedBatchLedgerDir(root string, changefeed string, identifier []string) string {
+	return filepath.Join(root, pathSegment(changefeed), ".committed", pathSegment(identifierKey(identifier)))
+}
+
+func committedBatchLedgerPath(root string, changefeed string, identifier []string, batchID string) string {
+	return filepath.Join(committedBatchLedgerDir(root, changefeed, identifier), batchID+".commit")
+}
+
+func committedRowLedgerDir(root string, changefeed string, identifier []string) string {
+	return filepath.Join(root, pathSegment(changefeed), ".committed-rows", pathSegment(identifierKey(identifier)))
+}
+
+func committedRowIndexDir(root string, changefeed string, identifier []string) string {
+	return filepath.Join(root, pathSegment(changefeed), ".committed-row-index", pathSegment(identifierKey(identifier)))
+}
+
+func committedRowSegmentLedgerDir(root string, changefeed string, identifier []string, bucket string) string {
+	return filepath.Join(committedRowLedgerDir(root, changefeed, identifier), bucket)
+}
+
+func committedRowHash(rowID string) string {
+	sum := sha256.Sum256([]byte(rowID))
+	return hex.EncodeToString(sum[:])
+}
+
+func committedRowLedgerBucket(rowID string) string {
+	return committedRowLedgerBucketFromHash(committedRowHash(rowID))
+}
+
+func committedRowLedgerBucketFromHash(rowHash string) string {
+	return rowHash[:1]
+}
+
+func committedRowIndexShard(rowID string) string {
+	return committedRowIndexShardFromHash(committedRowHash(rowID))
+}
+
+func committedRowIndexShardFromHash(rowHash string) string {
+	return rowHash[:2]
+}
+
+func committedRowIndexPath(root string, changefeed string, identifier []string) string {
+	return filepath.Join(committedRowIndexDir(root, changefeed, identifier), "row-index.db")
+}
+
+func committedRowIndexDirtyPath(root string, changefeed string, identifier []string) string {
+	return filepath.Join(committedRowIndexDir(root, changefeed, identifier), "row-index.dirty")
+}
+
+func committedRowSegmentLedgerPath(
+	root string,
+	changefeed string,
+	identifier []string,
+	bucket string,
+	batchIDs []string,
+	maxCommitTs uint64,
+) string {
+	payload := struct {
+		Bucket      string   `json:"bucket"`
+		BatchIDs    []string `json:"batch_ids"`
+		MaxCommitTs uint64   `json:"max_commit_ts"`
+	}{
+		Bucket:      bucket,
+		BatchIDs:    sortedStringsCopy(batchIDs),
+		MaxCommitTs: maxCommitTs,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		encoded = []byte(bucket)
+	}
+	sum := sha256.Sum256(encoded)
+	segmentID := hex.EncodeToString(sum[:])
+	return filepath.Join(
+		committedRowSegmentLedgerDir(root, changefeed, identifier, bucket),
+		fmt.Sprintf("%020d-%s-%s.rows", maxCommitTs, bucket, segmentID[:16]))
+}
+
+func sortedStringsCopy(values []string) []string {
+	copied := append([]string(nil), values...)
+	sort.Strings(copied)
+	return copied
+}
+
+func sortedMapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for value := range values {
+		keys = append(keys, value)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func stringSlicesEqual(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func stagedBatchID(identifier []string, rows []map[string]any, rowIDs []string, maxCommitTs uint64) (string, error) {
+	payload := struct {
+		Identifier  []string `json:"identifier"`
+		RowIDs      []string `json:"row_ids"`
+		MaxCommitTs uint64   `json:"max_commit_ts"`
+	}{
+		Identifier:  identifier,
+		RowIDs:      rowIDs,
+		MaxCommitTs: maxCommitTs,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func stagedRowID(identifier []string, row map[string]any) (string, error) {
+	payload := struct {
+		Identifier []string       `json:"identifier"`
+		Row        map[string]any `json:"row"`
+	}{
+		Identifier: identifier,
+		Row:        stagingRowIdentityPayload(row),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func stagingRowIdentityPayload(row map[string]any) map[string]any {
+	identity := make(map[string]any, len(row))
+	for key, value := range row {
+		switch key {
+		case stagingRowIDField, "_seq":
+			continue
+		default:
+			identity[key] = value
+		}
+	}
+	return identity
+}
+
+func stagingRowIDForEvent(
+	tableID int64,
+	startTs uint64,
+	commitTs uint64,
+	rowIndex int,
+	rowKey []byte,
+	row map[string]any,
+) (string, error) {
+	var rowIndexValue *int
+	if len(rowKey) == 0 {
+		rowIndexValue = &rowIndex
+	}
+	payload := struct {
+		TableID  int64          `json:"table_id"`
+		StartTs  uint64         `json:"start_ts"`
+		CommitTs uint64         `json:"commit_ts"`
+		RowIndex *int           `json:"row_index,omitempty"`
+		RowKey   []byte         `json:"row_key,omitempty"`
+		Row      map[string]any `json:"row"`
+	}{
+		TableID:  tableID,
+		StartTs:  startTs,
+		CommitTs: commitTs,
+		RowIndex: rowIndexValue,
+		RowKey:   rowKey,
+		Row:      stagingRowIdentityPayload(row),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
